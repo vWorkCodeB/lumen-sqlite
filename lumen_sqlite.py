@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -96,12 +97,50 @@ A helper function `create_readme` is available as a tool; prefer using it.
 4. **execute_script** — For multi-statement DDL (creating several tables and
    indices at once), use execute_script instead of calling execute_sql
    repeatedly. Separate statements with semicolons.
-5. **Query iteratively** — Start with broad queries, then refine. Use
+5. **bulk_insert** — For loading many rows at once, use bulk_insert. It wraps
+   all inserts in a single transaction for performance (see below).
+6. **import_csv** — To load CSV text directly into a table (auto-creates the
+   table from headers if it doesn't exist).
+7. **Query iteratively** — Start with broad queries, then refine. Use
    GROUP BY, JOINs, subqueries, window functions as needed. SQLite supports
    most of SQL-92 and many modern features (CTEs, window functions, JSON).
-6. **export_query_csv** — When you need to share results or feed them into
+8. **export_query_csv** — When you need to share results or feed them into
    another tool.
-7. **close_database** — When you're done. Open databases consume resources.
+9. **close_database** — When you're done. Open databases consume resources.
+
+## Discovering databases
+
+- **list_databases** — Shows currently open databases.
+- **list_database_files** — Shows .db files in the data directory, including
+  ones from prior sessions that aren't currently open.
+- **database_info** — One-call summary of an open database: _readme, all
+  tables with row counts, and column schemas. Use this instead of calling
+  list_tables + describe_table + SELECT COUNT(*) repeatedly.
+
+## Transaction guidance — bulk loading
+
+**Always wrap bulk inserts in an explicit transaction.** Without a transaction,
+SQLite commits after every single INSERT, which means a separate disk flush
+per row. With an explicit transaction, all rows are committed in one flush.
+
+The performance difference is dramatic — typically 50–100× faster for
+hundreds or thousands of rows.
+
+Pattern using execute_script:
+    BEGIN TRANSACTION;
+    INSERT INTO t VALUES (...);
+    INSERT INTO t VALUES (...);
+    -- ... many more rows ...
+    COMMIT;
+
+Or better, use the **bulk_insert** tool, which handles the transaction
+wrapping automatically and uses parameterized queries for safety.
+
+Even when using execute_sql in a loop (one INSERT per call), you can
+manually manage the transaction:
+    execute_sql(alias, "BEGIN TRANSACTION")
+    -- loop: execute_sql(alias, "INSERT INTO t VALUES (?, ?)", [...])
+    execute_sql(alias, "COMMIT")
 
 ## Schema design tips
 
@@ -317,6 +356,120 @@ def list_databases() -> list[str]:
 
 
 @mcp.tool()
+def list_database_files() -> str:
+    """List .db files in the data directory, including ones not currently open.
+
+    Useful for discovering databases from prior sessions. Returns file names,
+    sizes, and modification times. Does not open the databases.
+    """
+    files = []
+    for ext in sorted(_ALLOWED_EXTENSIONS):
+        files.extend(_DB_DIR.glob(f"*{ext}"))
+
+    if not files:
+        return f"No database files found in {_DB_DIR}"
+
+    lines = [f"Database files in {_DB_DIR}:", ""]
+    lines.append(f"{'File':<40} {'Size':>10} {'Modified'}")
+    lines.append("-" * 70)
+    for f in sorted(files):
+        stat = f.stat()
+        size_kb = stat.st_size / 1024
+        if size_kb < 1024:
+            size_str = f"{size_kb:.1f} KB"
+        else:
+            size_str = f"{size_kb/1024:.1f} MB"
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+        lines.append(f"{f.name:<40} {size_str:>10} {mtime}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def database_info(alias: str) -> str:
+    """Get a comprehensive summary of an open database in one call.
+
+    Returns:
+    - The _readme table contents (if present)
+    - All table names with row counts
+    - Column schemas for each table
+
+    Use this instead of calling list_tables + describe_table + SELECT COUNT(*)
+    repeatedly. One call, full picture.
+
+    Args:
+        alias: The alias of the database.
+    """
+    conn = _get_conn(alias)
+    lines: list[str] = [f"Database: {alias}", "=" * 60]
+
+    # _readme contents
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='_readme'"
+        )
+        if cursor.fetchone():
+            lines.append("")
+            lines.append("## _readme")
+            readme_cursor = conn.execute("SELECT key, value FROM _readme ORDER BY key")
+            for key, value in readme_cursor:
+                lines.append(f"  {key}: {value}")
+    except sqlite3.Error:
+        pass
+
+    # All tables with row counts
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    )
+    tables = [row[0] for row in cursor.fetchall()]
+
+    if not tables:
+        lines.append("")
+        lines.append("(no tables)")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("## Tables")
+    lines.append("")
+
+    for table in tables:
+        if table == "sqlite_sequence":
+            continue  # internal bookkeeping table
+
+        # Row count
+        try:
+            count_cursor = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
+            count = count_cursor.fetchone()[0]
+        except sqlite3.Error:
+            count = "?"
+
+        lines.append(f"### {table} ({count} rows)")
+
+        # Column info
+        try:
+            col_cursor = conn.execute(f'PRAGMA table_info("{table}")')
+            cols = col_cursor.fetchall()
+            for col in cols:
+                cid, name, col_type, notnull, default_val, pk = col
+                parts = [f"  {name}"]
+                if col_type:
+                    parts.append(col_type)
+                if pk:
+                    parts.append("PK")
+                if notnull:
+                    parts.append("NOT NULL")
+                if default_val is not None:
+                    parts.append(f"DEFAULT {default_val}")
+                lines.append(" ".join(parts))
+        except sqlite3.Error:
+            lines.append("  (unable to read schema)")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def execute_sql(alias: str, sql: str, params: list[Any] | None = None) -> str:
     """Execute a SQL statement against an open database.
 
@@ -381,6 +534,112 @@ def execute_script(alias: str, script: str) -> str:
         return "Script executed successfully."
     except sqlite3.Error as exc:
         return f"SQL error: {exc}"
+
+
+@mcp.tool()
+def bulk_insert(
+    alias: str,
+    table: str,
+    columns: list[str],
+    rows: list[list[Any]],
+) -> str:
+    """Insert many rows into a table in a single, transaction-wrapped call.
+
+    All rows are inserted within an explicit transaction using executemany(),
+    which is dramatically faster than individual INSERT calls (typically
+    50-100x for hundreds of rows). The transaction is committed on success
+    or rolled back on any error.
+
+    Args:
+        alias: The alias of the database.
+        table: The table to insert into.
+        columns: List of column names, e.g. ["name", "age", "city"].
+        rows: List of rows, each row being a list of values matching the
+              columns. e.g. [["Alice", 30, "NYC"], ["Bob", 25, "LA"]].
+    """
+    conn = _get_conn(alias)
+
+    if not rows:
+        return "No rows to insert."
+
+    col_clause = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    sql = f'INSERT INTO "{table}" ({col_clause}) VALUES ({placeholders})'
+
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(sql, rows)
+        conn.execute("COMMIT")
+        log.info("Bulk-inserted %d rows into '%s.%s'", len(rows), alias, table)
+        return f"Inserted {len(rows)} rows into '{table}'."
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        return f"Bulk insert error (rolled back): {exc}"
+
+
+@mcp.tool()
+def import_csv(
+    alias: str,
+    csv_text: str,
+    table: str | None = None,
+    if_exists: str = "append",
+) -> str:
+    """Import CSV text into a table.
+
+    If the table does not exist, it will be created automatically with
+    column names taken from the CSV header row (all columns TEXT).
+
+    All rows are inserted within a single transaction for performance.
+
+    Args:
+        alias: The alias of the database.
+        csv_text: CSV-formatted text with a header row followed by data rows.
+        table: Target table name. Defaults to "imported".
+        if_exists: What to do if the table already exists:
+                   "append" (default) — add rows to existing table.
+                   "replace" — drop and recreate the table first.
+    """
+    conn = _get_conn(alias)
+    table = table or "imported"
+
+    reader = csv.reader(io.StringIO(csv_text))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        return "CSV text is empty (no header row)."
+
+    headers = [h.strip() for h in headers]
+    if not headers:
+        return "CSV header row is empty."
+
+    rows = [row for row in reader if row]  # skip blank lines
+    if not rows:
+        return "CSV has a header row but no data rows."
+
+    try:
+        if if_exists == "replace":
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+        # Create table if it doesn't exist
+        col_defs = ", ".join(f'"{h}" TEXT' for h in headers)
+        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
+
+        # Insert all rows in a transaction
+        placeholders = ", ".join("?" for _ in headers)
+        sql = f'INSERT INTO "{table}" VALUES ({placeholders})'
+        conn.execute("BEGIN TRANSACTION")
+        conn.executemany(sql, rows)
+        conn.execute("COMMIT")
+
+        log.info("Imported %d rows into '%s.%s'", len(rows), alias, table)
+        return f"Imported {len(rows)} rows into '{table}' ({len(headers)} columns: {', '.join(headers)})."
+
+    except sqlite3.Error as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        return f"Import error: {exc}"
 
 
 @mcp.tool()
@@ -511,6 +770,18 @@ Suggested schema (including _readme for self-documentation):
         surveyed_at TEXT DEFAULT (datetime('now'))
     );
 
+**Bulk loading tip:** When inserting many rows, always wrap them in a
+transaction for dramatically better performance:
+
+    BEGIN TRANSACTION;
+    INSERT INTO survey (...) VALUES (...);
+    INSERT INTO survey (...) VALUES (...);
+    -- ... many more rows ...
+    COMMIT;
+
+Or better yet, use the `bulk_insert` tool which handles transaction
+wrapping automatically and accepts a list of rows.
+
 After collecting data, useful analysis queries include:
 - COUNT and GROUP BY to find distributions
 - WHERE filters to find items matching criteria
@@ -560,6 +831,16 @@ Suggested schema (including _readme):
     CREATE INDEX idx_errors_code ON errors(error_code);
     CREATE INDEX idx_errors_status ON errors(status);
 
+**Bulk loading tip:** If you have many errors to record, wrap them in a
+single transaction or use the `bulk_insert` tool:
+
+    BEGIN TRANSACTION;
+    INSERT INTO errors (file, line, error_code, message) VALUES (...);
+    INSERT INTO errors (file, line, error_code, message) VALUES (...);
+    COMMIT;
+
+This is 50-100x faster than individual auto-committed inserts.
+
 After recording all errors, I'll analyze with:
     SELECT error_code, COUNT(*) as n FROM errors GROUP BY error_code ORDER BY n DESC;
     SELECT file, COUNT(*) as n FROM errors GROUP BY file ORDER BY n DESC;
@@ -606,6 +887,10 @@ Suggested schema (including _readme):
         key TEXT PRIMARY KEY,
         -- matching property columns
     );
+
+**Bulk loading tip:** When loading the sets, use `bulk_insert` or wrap
+inserts in a transaction (BEGIN TRANSACTION / INSERT ... / COMMIT) for
+dramatically better performance — especially when comparing large sets.
 
 Analysis queries:
     -- Only in left
