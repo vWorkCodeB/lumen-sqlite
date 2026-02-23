@@ -1,0 +1,13 @@
+[project]
+name = "lumen-sqlite"
+version = "0.1.0"
+description = "An MCP server for storing and manipulating structured data using SQLite"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
