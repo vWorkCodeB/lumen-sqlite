@@ -51,6 +51,32 @@ querying, filtering, aggregating, joining, or sorting.** Specific signals:
 - You need to cross-reference relationships between entities.
 - You're accumulating data over multiple steps and will query it later.
 
+## The _readme convention
+
+When you create a database for your own use, always create a table named
+`_readme` as the first thing you do. This table is self-documentation:
+it describes the purpose of the database and its tables so that any future
+session (or any other AI) can understand what the database is for.
+
+Schema:
+    CREATE TABLE _readme (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+Required rows:
+    INSERT INTO _readme VALUES ('purpose', '<one-sentence description>');
+    INSERT INTO _readme VALUES ('created', datetime('now'));
+
+Recommended additional rows — one per table:
+    INSERT INTO _readme VALUES ('table:<name>', '<what this table holds>');
+
+The underscore prefix sorts _readme to the top of table listings. Read it
+first when opening an unfamiliar database. Do NOT create _readme for
+databases you received from external sources — only for databases you create.
+
+A helper function `create_readme` is available as a tool; prefer using it.
+
 ## When NOT to use this tool
 
 - For narrative text, documentation, or free-form notes — use files instead.
@@ -220,6 +246,54 @@ def open_database(path: str, alias: str | None = None) -> str:
     verb = "Created and opened" if creating else "Opened"
     log.info("%s database '%s' at %s", verb, alias, db_path)
     return f"{verb} database '{alias}' at {db_path}"
+
+
+@mcp.tool()
+def create_readme(alias: str, purpose: str, tables: dict[str, str] | None = None) -> str:
+    """Create or replace a _readme table that documents the database.
+
+    Call this immediately after creating a new database for your own use.
+    Do NOT call this for databases received from external sources.
+
+    The _readme table serves as self-documentation: any future session or
+    any other AI that opens this database can read _readme to understand
+    what the database is for and what each table contains.
+
+    Args:
+        alias: The alias of the database.
+        purpose: A one-sentence description of the database's purpose.
+        tables: Optional dict mapping table names to descriptions.
+                e.g. {"tools": "SDK tools and their porting status",
+                       "warnings": "Clang warning categories encountered"}
+    """
+    conn = _get_conn(alias)
+    try:
+        conn.execute("DROP TABLE IF EXISTS _readme")
+        conn.execute("""
+            CREATE TABLE _readme (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO _readme VALUES ('purpose', ?)", (purpose,)
+        )
+        conn.execute(
+            "INSERT INTO _readme VALUES ('created', datetime('now'))"
+        )
+        if tables:
+            for tbl_name, tbl_desc in tables.items():
+                conn.execute(
+                    "INSERT INTO _readme VALUES (?, ?)",
+                    (f"table:{tbl_name}", tbl_desc),
+                )
+        conn.commit()
+        log.info("Created _readme in '%s'", alias)
+        n = 2 + (len(tables) if tables else 0)
+        return f"Created _readme table with {n} entries in '{alias}'."
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return f"Error creating _readme: {exc}"
 
 
 @mcp.tool()
@@ -420,7 +494,15 @@ Here's my plan:
 3. Systematically examine each item and record findings.
 4. Use SQL queries to analyze patterns, counts, and groupings.
 
-Suggested schema:
+Suggested schema (including _readme for self-documentation):
+
+    CREATE TABLE _readme (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO _readme VALUES ('purpose', 'Survey of {topic}');
+    INSERT INTO _readme VALUES ('created', datetime('now'));
+    INSERT INTO _readme VALUES ('table:survey', 'Items surveyed with properties');
 
     CREATE TABLE survey (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -454,7 +536,15 @@ Plan:
 3. Use GROUP BY to find the most common error types.
 4. Track which errors I've fixed vs. which remain.
 
-Suggested schema:
+Suggested schema (including _readme):
+
+    CREATE TABLE _readme (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO _readme VALUES ('purpose', 'Error triage from {error_source}');
+    INSERT INTO _readme VALUES ('created', datetime('now'));
+    INSERT INTO _readme VALUES ('table:errors', 'Individual errors with status tracking');
 
     CREATE TABLE errors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -497,7 +587,16 @@ Plan:
    - Items in both (matched)
    - Items in both but with different properties (mismatched)
 
-Suggested schema:
+Suggested schema (including _readme):
+
+    CREATE TABLE _readme (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO _readme VALUES ('purpose', 'Comparison: {left_name} vs {right_name}');
+    INSERT INTO _readme VALUES ('created', datetime('now'));
+    INSERT INTO _readme VALUES ('table:left_set', '{left_name}');
+    INSERT INTO _readme VALUES ('table:right_set', '{right_name}');
 
     CREATE TABLE left_set (
         key TEXT PRIMARY KEY,
