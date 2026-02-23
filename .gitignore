@@ -9,3 +9,7 @@ build/
 *.sqlite
 *.sqlite3
 .uv/
+
+*.db-shm
+*.db-wal
+*.db-journal
