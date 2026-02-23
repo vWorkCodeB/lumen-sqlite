@@ -82,9 +82,15 @@ def _format_rows(
 ) -> dict[str, Any]:
     """Fetch rows from a cursor and return a structured result."""
     if cursor.description is None:
+        rc = cursor.rowcount
+        if rc < 0:
+            return {
+                "rowcount": 0,
+                "message": "Statement executed successfully.",
+            }
         return {
-            "rowcount": cursor.rowcount,
-            "message": f"{cursor.rowcount} row(s) affected.",
+            "rowcount": rc,
+            "message": f"{rc} row(s) affected.",
         }
 
     columns = [desc[0] for desc in cursor.description]
