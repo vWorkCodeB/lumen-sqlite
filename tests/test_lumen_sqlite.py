@@ -583,3 +583,115 @@ class TestPrompts:
         result = ls.comparison("expected files", "actual files")
         assert "expected files" in result
         assert "actual files" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests — Security
+# ---------------------------------------------------------------------------
+
+class TestEscapeIdentifier:
+    def test_plain_name(self):
+        assert ls._escape_identifier("foo") == "foo"
+
+    def test_embedded_quote(self):
+        assert ls._escape_identifier('foo"bar') == 'foo""bar'
+
+    def test_empty(self):
+        assert ls._escape_identifier("") == ""
+
+
+class TestPathSandbox:
+    """Test that LUMEN_SQLITE_SANDBOX restricts paths to _DB_DIR."""
+
+    def test_sandbox_blocks_absolute_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ls, "_SANDBOX", True)
+        outside = str(tmp_path / "escape.db")
+        with pytest.raises(ValueError, match="outside the allowed directory"):
+            ls._resolve_db_path(outside)
+
+    def test_sandbox_blocks_traversal(self, monkeypatch):
+        monkeypatch.setattr(ls, "_SANDBOX", True)
+        with pytest.raises(ValueError, match="outside the allowed directory"):
+            ls._resolve_db_path("../../escape.db")
+
+    def test_sandbox_allows_relative_in_db_dir(self, monkeypatch):
+        monkeypatch.setattr(ls, "_SANDBOX", True)
+        # Should succeed — relative path resolves inside _DB_DIR
+        p = ls._resolve_db_path("allowed.db")
+        assert str(p).startswith(str(ls._DB_DIR))
+
+    def test_no_sandbox_allows_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ls, "_SANDBOX", False)
+        outside = str(tmp_path / "anywhere.db")
+        # Should succeed — sandbox is off
+        p = ls._resolve_db_path(outside)
+        assert p == tmp_path / "anywhere.db"
+
+
+class TestDescribeTableValidation:
+    def test_rejects_bad_table_name(self, db):
+        with pytest.raises(ValueError, match="Invalid table name"):
+            ls.describe_table("test", "drop;--")
+
+    def test_rejects_space_in_name(self, db):
+        with pytest.raises(ValueError, match="Invalid table name"):
+            ls.describe_table("test", "my table")
+
+
+class TestDropTableValidation:
+    def test_rejects_bad_table_name(self, db):
+        with pytest.raises(ValueError, match="Invalid table name"):
+            ls.drop_table("test", "Robert'); DROP TABLE students;--")
+
+    def test_rejects_quotes_in_name(self, db):
+        with pytest.raises(ValueError, match="Invalid table name"):
+            ls.drop_table("test", 'foo"bar')
+
+
+class TestExportCsvBounded:
+    def test_truncation(self, db):
+        conn = ls._get_conn("test")
+        conn.execute("CREATE TABLE big (n INTEGER)")
+        conn.executemany(
+            "INSERT INTO big VALUES (?)", [(i,) for i in range(200)]
+        )
+        conn.commit()
+
+        result = ls.export_query_csv(
+            "test", "SELECT * FROM big", max_rows=10
+        )
+        # Should have header + 10 data rows + truncation notice
+        lines = [l for l in result.strip().split("\n") if l]
+        data_lines = [l for l in lines if not l.startswith("#")]
+        assert len(data_lines) == 11  # 1 header + 10 rows
+        assert "truncated" in result
+
+    def test_no_truncation_when_under_limit(self, db):
+        conn = ls._get_conn("test")
+        conn.execute("CREATE TABLE small (n INTEGER)")
+        conn.executemany(
+            "INSERT INTO small VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn.commit()
+
+        result = ls.export_query_csv(
+            "test", "SELECT * FROM small", max_rows=100
+        )
+        assert "truncated" not in result
+
+
+class TestDatabaseInfoEscaping:
+    """Verify database_info handles tables with unusual names safely."""
+
+    def test_table_with_quote_in_name(self, db):
+        conn = ls._get_conn("test")
+        # Create a table with a double-quote in the name (unusual but valid)
+        conn.execute('CREATE TABLE "weird""name" (id INTEGER)')
+        conn.execute('INSERT INTO "weird""name" VALUES (1)')
+        conn.commit()
+
+        # database_info should handle this without crashing
+        result = ls.database_info("test")
+        assert isinstance(result, str)
+        # The table should appear in the output
+        assert 'weird"name' in result or "weird" in result
