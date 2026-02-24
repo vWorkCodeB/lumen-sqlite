@@ -11,6 +11,8 @@ import csv
 import io
 import logging
 import os
+import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -117,6 +119,26 @@ A helper function `create_readme` is available as a tool; prefer using it.
   tables with row counts, and column schemas. Use this instead of calling
   list_tables + describe_table + SELECT COUNT(*) repeatedly.
 
+## Table management
+
+- **drop_table** — Drop a table. Returns a preview of what will be dropped
+  (row count, columns) so you can confirm before proceeding.
+- **rename_table** — Rename a table via ALTER TABLE ... RENAME TO.
+
+## Query debugging
+
+- **explain_query** — Wraps EXPLAIN QUERY PLAN. Shows how SQLite will execute
+  a query — whether it uses indices, does full table scans, etc. Useful for
+  understanding and optimizing query performance.
+
+## Database maintenance
+
+- **compact_database** — Runs VACUUM to rebuild the database file and reclaim
+  space freed by deletes. The file size won't shrink after DELETEs until you
+  run this.
+- **backup_database** — Safely copy an open database to a new file using
+  SQLite's backup API. Safe to run while the database is in use.
+
 ## Transaction guidance — bulk loading
 
 **Always wrap bulk inserts in an explicit transaction.** Without a transaction,
@@ -195,10 +217,30 @@ _ALLOWED_EXTENSIONS = {".db", ".sqlite", ".sqlite3"}
 # Can be overridden via the LUMEN_SQLITE_DB_DIR environment variable.
 _DB_DIR: Path = Path(os.environ.get("LUMEN_SQLITE_DB_DIR", ".")).resolve()
 
+# Default max rows returned by execute_sql. Can be overridden via env var.
+_DEFAULT_MAX_ROWS: int = int(os.environ.get("LUMEN_SQLITE_MAX_ROWS", "500"))
+
+# Pattern for safe SQL identifiers (table names, column names).
+# Allows: letters, digits, underscores, and leading underscore (for _readme).
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _validate_identifier(name: str, kind: str = "identifier") -> None:
+    """Validate that a name is a safe SQL identifier.
+
+    Raises ValueError if the name contains characters that could enable
+    SQL injection when used in dynamically-constructed queries.
+    """
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(
+            f"Invalid {kind}: {name!r}. "
+            f"Must match [A-Za-z_][A-Za-z0-9_]* (letters, digits, underscores)."
+        )
+
 
 def _resolve_db_path(path_str: str) -> Path:
     """Resolve and validate a database file path."""
@@ -228,9 +270,12 @@ def _get_conn(alias: str) -> sqlite3.Connection:
 
 def _format_rows(
     cursor: sqlite3.Cursor,
-    max_rows: int = 500,
+    max_rows: int | None = None,
 ) -> dict[str, Any]:
     """Fetch rows from a cursor and return a structured result."""
+    if max_rows is None:
+        max_rows = _DEFAULT_MAX_ROWS
+
     if cursor.description is None:
         rc = cursor.rowcount
         if rc < 0:
@@ -256,7 +301,7 @@ def _format_rows(
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# MCP Tools — Database lifecycle
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -274,7 +319,10 @@ def open_database(path: str, alias: str | None = None) -> str:
         alias = db_path.stem
 
     if alias in _connections:
-        return f"Database '{alias}' is already open ({_connections[alias]}). Close it first or choose a different alias."
+        return (
+            f"Database '{alias}' is already open. "
+            "Close it first or choose a different alias."
+        )
 
     creating = not db_path.exists()
     conn = sqlite3.connect(str(db_path))
@@ -288,7 +336,230 @@ def open_database(path: str, alias: str | None = None) -> str:
 
 
 @mcp.tool()
-def create_readme(alias: str, purpose: str, tables: dict[str, str] | None = None) -> str:
+def close_database(alias: str) -> str:
+    """Close an open database connection.
+
+    Args:
+        alias: The alias of the database to close.
+    """
+    conn = _get_conn(alias)
+    conn.close()
+    del _connections[alias]
+    log.info("Closed database '%s'", alias)
+    return f"Closed database '{alias}'."
+
+
+@mcp.tool()
+def list_databases() -> list[str]:
+    """List all currently open database aliases."""
+    return sorted(_connections.keys())
+
+
+@mcp.tool()
+def list_database_files() -> str:
+    """List .db files in the data directory, including ones not currently open.
+
+    Useful for discovering databases from prior sessions. Returns file names,
+    sizes, and modification times. Does not open the databases.
+    """
+    files = []
+    for ext in sorted(_ALLOWED_EXTENSIONS):
+        files.extend(_DB_DIR.glob(f"*{ext}"))
+
+    if not files:
+        return f"No database files found in {_DB_DIR}"
+
+    lines = [f"Database files in {_DB_DIR}:", ""]
+    lines.append(f"{'File':<40} {'Size':>10} {'Modified'}")
+    lines.append("-" * 70)
+    for f in sorted(files):
+        stat = f.stat()
+        size_kb = stat.st_size / 1024
+        if size_kb < 1024:
+            size_str = f"{size_kb:.1f} KB"
+        else:
+            size_str = f"{size_kb / 1024:.1f} MB"
+        mtime = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)
+        )
+        lines.append(f"{f.name:<40} {size_str:>10} {mtime}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def database_info(alias: str) -> str:
+    """Get a comprehensive summary of an open database in one call.
+
+    Returns:
+    - The _readme table contents (if present)
+    - All table names with row counts
+    - Column schemas for each table
+
+    Use this instead of calling list_tables + describe_table + SELECT COUNT(*)
+    repeatedly. One call, full picture.
+
+    Args:
+        alias: The alias of the database.
+    """
+    conn = _get_conn(alias)
+    lines: list[str] = [f"Database: {alias}", "=" * 60]
+
+    # _readme contents
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='_readme'"
+        )
+        if cursor.fetchone():
+            lines.append("")
+            lines.append("## _readme")
+            readme_cursor = conn.execute(
+                "SELECT key, value FROM _readme ORDER BY key"
+            )
+            for key, value in readme_cursor:
+                lines.append(f"  {key}: {value}")
+    except sqlite3.Error:
+        pass
+
+    # All tables with row counts
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    )
+    tables = [row[0] for row in cursor.fetchall()]
+
+    if not tables:
+        lines.append("")
+        lines.append("(no tables)")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("## Tables")
+    lines.append("")
+
+    for table in tables:
+        if table == "sqlite_sequence":
+            continue  # internal bookkeeping table
+
+        # Row count
+        try:
+            count_cursor = conn.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            )
+            count = count_cursor.fetchone()[0]
+        except sqlite3.Error:
+            count = "?"
+
+        lines.append(f"### {table} ({count} rows)")
+
+        # Column info
+        try:
+            col_cursor = conn.execute(f'PRAGMA table_info("{table}")')
+            cols = col_cursor.fetchall()
+            for col in cols:
+                cid, name, col_type, notnull, default_val, pk = col
+                parts = [f"  {name}"]
+                if col_type:
+                    parts.append(col_type)
+                if pk:
+                    parts.append("PK")
+                if notnull:
+                    parts.append("NOT NULL")
+                if default_val is not None:
+                    parts.append(f"DEFAULT {default_val}")
+                lines.append(" ".join(parts))
+        except sqlite3.Error:
+            lines.append("  (unable to read schema)")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def backup_database(alias: str, destination: str) -> str:
+    """Safely copy an open database to a new file.
+
+    Uses SQLite's backup API, which is safe to call while the database is
+    in use (it handles locking and WAL checkpointing correctly). This is
+    safer than copying the file directly.
+
+    Args:
+        alias: The alias of the source database.
+        destination: Path for the backup file (.db / .sqlite / .sqlite3).
+    """
+    conn = _get_conn(alias)
+    dest_path = _resolve_db_path(destination)
+
+    if dest_path.exists():
+        return (
+            f"Destination '{dest_path}' already exists. "
+            "Choose a different path or remove it first."
+        )
+
+    try:
+        dest_conn = sqlite3.connect(str(dest_path))
+        conn.backup(dest_conn)
+        dest_conn.close()
+        size_kb = dest_path.stat().st_size / 1024
+        log.info("Backed up '%s' to %s", alias, dest_path)
+        return f"Backed up '{alias}' to {dest_path} ({size_kb:.1f} KB)."
+    except sqlite3.Error as exc:
+        # Clean up partial backup
+        if dest_path.exists():
+            dest_path.unlink()
+        return f"Backup error: {exc}"
+
+
+@mcp.tool()
+def compact_database(alias: str) -> str:
+    """Rebuild the database file to reclaim free space (VACUUM).
+
+    After many DELETE operations, the database file doesn't shrink — the
+    freed pages are kept for reuse. VACUUM rebuilds the file, reclaiming
+    that space. This can take a moment for large databases.
+
+    Args:
+        alias: The alias of the database.
+    """
+    conn = _get_conn(alias)
+
+    try:
+        # Get size before
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        size_before = db_path.stat().st_size
+
+        conn.execute("VACUUM")
+
+        size_after = db_path.stat().st_size
+        saved = size_before - size_after
+        saved_kb = saved / 1024
+
+        if saved > 0:
+            return (
+                f"Compacted '{alias}': "
+                f"{size_before / 1024:.1f} KB → {size_after / 1024:.1f} KB "
+                f"(saved {saved_kb:.1f} KB)."
+            )
+        else:
+            return (
+                f"Compacted '{alias}': no space to reclaim "
+                f"({size_after / 1024:.1f} KB)."
+            )
+    except sqlite3.Error as exc:
+        return f"Compact error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — Self-documentation
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_readme(
+    alias: str,
+    purpose: str,
+    tables: dict[str, str] | None = None,
+) -> str:
     """Create or replace a _readme table that documents the database.
 
     Call this immediately after creating a new database for your own use.
@@ -335,142 +606,17 @@ def create_readme(alias: str, purpose: str, tables: dict[str, str] | None = None
         return f"Error creating _readme: {exc}"
 
 
-@mcp.tool()
-def close_database(alias: str) -> str:
-    """Close an open database connection.
-
-    Args:
-        alias: The alias of the database to close.
-    """
-    conn = _get_conn(alias)
-    conn.close()
-    del _connections[alias]
-    log.info("Closed database '%s'", alias)
-    return f"Closed database '{alias}'."
-
+# ---------------------------------------------------------------------------
+# MCP Tools — SQL execution
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_databases() -> list[str]:
-    """List all currently open database aliases."""
-    return sorted(_connections.keys())
-
-
-@mcp.tool()
-def list_database_files() -> str:
-    """List .db files in the data directory, including ones not currently open.
-
-    Useful for discovering databases from prior sessions. Returns file names,
-    sizes, and modification times. Does not open the databases.
-    """
-    files = []
-    for ext in sorted(_ALLOWED_EXTENSIONS):
-        files.extend(_DB_DIR.glob(f"*{ext}"))
-
-    if not files:
-        return f"No database files found in {_DB_DIR}"
-
-    lines = [f"Database files in {_DB_DIR}:", ""]
-    lines.append(f"{'File':<40} {'Size':>10} {'Modified'}")
-    lines.append("-" * 70)
-    for f in sorted(files):
-        stat = f.stat()
-        size_kb = stat.st_size / 1024
-        if size_kb < 1024:
-            size_str = f"{size_kb:.1f} KB"
-        else:
-            size_str = f"{size_kb/1024:.1f} MB"
-        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
-        lines.append(f"{f.name:<40} {size_str:>10} {mtime}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def database_info(alias: str) -> str:
-    """Get a comprehensive summary of an open database in one call.
-
-    Returns:
-    - The _readme table contents (if present)
-    - All table names with row counts
-    - Column schemas for each table
-
-    Use this instead of calling list_tables + describe_table + SELECT COUNT(*)
-    repeatedly. One call, full picture.
-
-    Args:
-        alias: The alias of the database.
-    """
-    conn = _get_conn(alias)
-    lines: list[str] = [f"Database: {alias}", "=" * 60]
-
-    # _readme contents
-    try:
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='_readme'"
-        )
-        if cursor.fetchone():
-            lines.append("")
-            lines.append("## _readme")
-            readme_cursor = conn.execute("SELECT key, value FROM _readme ORDER BY key")
-            for key, value in readme_cursor:
-                lines.append(f"  {key}: {value}")
-    except sqlite3.Error:
-        pass
-
-    # All tables with row counts
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    )
-    tables = [row[0] for row in cursor.fetchall()]
-
-    if not tables:
-        lines.append("")
-        lines.append("(no tables)")
-        return "\n".join(lines)
-
-    lines.append("")
-    lines.append("## Tables")
-    lines.append("")
-
-    for table in tables:
-        if table == "sqlite_sequence":
-            continue  # internal bookkeeping table
-
-        # Row count
-        try:
-            count_cursor = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
-            count = count_cursor.fetchone()[0]
-        except sqlite3.Error:
-            count = "?"
-
-        lines.append(f"### {table} ({count} rows)")
-
-        # Column info
-        try:
-            col_cursor = conn.execute(f'PRAGMA table_info("{table}")')
-            cols = col_cursor.fetchall()
-            for col in cols:
-                cid, name, col_type, notnull, default_val, pk = col
-                parts = [f"  {name}"]
-                if col_type:
-                    parts.append(col_type)
-                if pk:
-                    parts.append("PK")
-                if notnull:
-                    parts.append("NOT NULL")
-                if default_val is not None:
-                    parts.append(f"DEFAULT {default_val}")
-                lines.append(" ".join(parts))
-        except sqlite3.Error:
-            lines.append("  (unable to read schema)")
-
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def execute_sql(alias: str, sql: str, params: list[Any] | None = None) -> str:
+def execute_sql(
+    alias: str,
+    sql: str,
+    params: list[Any] | None = None,
+    max_rows: int | None = None,
+) -> str:
     """Execute a SQL statement against an open database.
 
     Returns query results for SELECT statements, or an affected-row count
@@ -487,13 +633,15 @@ def execute_sql(alias: str, sql: str, params: list[Any] | None = None) -> str:
         alias: The alias of the database to query.
         sql: The SQL statement to execute.
         params: Optional list of bind parameters (for parameterized queries).
+        max_rows: Maximum rows to return (default: 500, configurable via
+                  LUMEN_SQLITE_MAX_ROWS env var).
     """
     conn = _get_conn(alias)
     params = params or []
 
     try:
         cursor = conn.execute(sql, params)
-        result = _format_rows(cursor)
+        result = _format_rows(cursor, max_rows=max_rows)
         conn.commit()
     except sqlite3.Error as exc:
         conn.rollback()
@@ -505,7 +653,9 @@ def execute_sql(alias: str, sql: str, params: list[Any] | None = None) -> str:
         for row in result["rows"]:
             lines.append("\t".join(str(v) for v in row))
         if result["truncated"]:
-            lines.append(f"... (results truncated at {result['row_count']} rows)")
+            lines.append(
+                f"... (results truncated at {result['row_count']} rows)"
+            )
         return "\n".join(lines)
     else:
         return result["message"]
@@ -525,7 +675,8 @@ def execute_script(alias: str, script: str) -> str:
 
     Args:
         alias: The alias of the database.
-        script: SQL script containing one or more statements separated by semicolons.
+        script: SQL script containing one or more statements separated by
+                semicolons.
     """
     conn = _get_conn(alias)
     try:
@@ -535,6 +686,43 @@ def execute_script(alias: str, script: str) -> str:
     except sqlite3.Error as exc:
         return f"SQL error: {exc}"
 
+
+@mcp.tool()
+def explain_query(alias: str, sql: str, params: list[Any] | None = None) -> str:
+    """Show how SQLite will execute a query (EXPLAIN QUERY PLAN).
+
+    Use this to understand query performance — whether indices are being
+    used, whether full table scans occur, and the join order.
+
+    Args:
+        alias: The alias of the database.
+        sql: The SQL query to explain.
+        params: Optional bind parameters (same as execute_sql).
+    """
+    conn = _get_conn(alias)
+    params = params or []
+
+    try:
+        cursor = conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        return f"SQL error: {exc}"
+
+    if not rows:
+        return "No query plan available."
+
+    lines = ["Query plan:", ""]
+    for row in rows:
+        # EXPLAIN QUERY PLAN returns (selectid, order, from, detail)
+        indent = "  " * row[0] if row[0] else ""
+        lines.append(f"{indent}{row[3]}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — Bulk data operations
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def bulk_insert(
@@ -562,7 +750,12 @@ def bulk_insert(
     if not rows:
         return "No rows to insert."
 
-    col_clause = ", ".join(columns)
+    # Validate identifiers
+    _validate_identifier(table, "table name")
+    for col in columns:
+        _validate_identifier(col, "column name")
+
+    col_clause = ", ".join(f'"{c}"' for c in columns)
     placeholders = ", ".join("?" for _ in columns)
     sql = f'INSERT INTO "{table}" ({col_clause}) VALUES ({placeholders})'
 
@@ -570,7 +763,9 @@ def bulk_insert(
         conn.execute("BEGIN TRANSACTION")
         conn.executemany(sql, rows)
         conn.execute("COMMIT")
-        log.info("Bulk-inserted %d rows into '%s.%s'", len(rows), alias, table)
+        log.info(
+            "Bulk-inserted %d rows into '%s.%s'", len(rows), alias, table
+        )
         return f"Inserted {len(rows)} rows into '{table}'."
     except sqlite3.Error as exc:
         conn.execute("ROLLBACK")
@@ -602,6 +797,9 @@ def import_csv(
     conn = _get_conn(alias)
     table = table or "imported"
 
+    # Validate table name
+    _validate_identifier(table, "table name")
+
     reader = csv.reader(io.StringIO(csv_text))
     try:
         headers = next(reader)
@@ -611,6 +809,10 @@ def import_csv(
     headers = [h.strip() for h in headers]
     if not headers:
         return "CSV header row is empty."
+
+    # Validate column names from CSV headers
+    for h in headers:
+        _validate_identifier(h, "column name (from CSV header)")
 
     rows = [row for row in reader if row]  # skip blank lines
     if not rows:
@@ -622,7 +824,9 @@ def import_csv(
 
         # Create table if it doesn't exist
         col_defs = ", ".join(f'"{h}" TEXT' for h in headers)
-        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
+        conn.execute(
+            f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})'
+        )
 
         # Insert all rows in a transaction
         placeholders = ", ".join("?" for _ in headers)
@@ -632,7 +836,10 @@ def import_csv(
         conn.execute("COMMIT")
 
         log.info("Imported %d rows into '%s.%s'", len(rows), alias, table)
-        return f"Imported {len(rows)} rows into '{table}' ({len(headers)} columns: {', '.join(headers)})."
+        return (
+            f"Imported {len(rows)} rows into '{table}' "
+            f"({len(headers)} columns: {', '.join(headers)})."
+        )
 
     except sqlite3.Error as exc:
         try:
@@ -641,6 +848,46 @@ def import_csv(
             pass
         return f"Import error: {exc}"
 
+
+@mcp.tool()
+def export_query_csv(
+    alias: str,
+    sql: str,
+    params: list[Any] | None = None,
+) -> str:
+    """Run a SELECT query and return results as CSV text.
+
+    Useful for exporting data or feeding into other tools.
+
+    Args:
+        alias: The alias of the database.
+        sql: A SELECT statement.
+        params: Optional bind parameters.
+    """
+    conn = _get_conn(alias)
+    params = params or []
+
+    try:
+        cursor = conn.execute(sql, params)
+    except sqlite3.Error as exc:
+        return f"SQL error: {exc}"
+
+    if cursor.description is None:
+        return "Statement did not return results."
+
+    columns = [desc[0] for desc in cursor.description]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(columns)
+    for row in cursor:
+        writer.writerow(row)
+
+    return output.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — Schema inspection and management
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def list_tables(alias: str) -> str:
@@ -670,24 +917,31 @@ def describe_table(alias: str, table: str) -> str:
     conn = _get_conn(alias)
 
     # Get column info via PRAGMA
-    cursor = conn.execute(f"PRAGMA table_info({table})")
+    cursor = conn.execute(f'PRAGMA table_info("{table}")')
     columns = cursor.fetchall()
     if not columns:
         return f"Table '{table}' not found."
 
     lines = [f"Table: {table}", ""]
-    lines.append(f"{'#':<4} {'Name':<30} {'Type':<15} {'Nullable':<10} {'Default':<15} {'PK'}")
+    lines.append(
+        f"{'#':<4} {'Name':<30} {'Type':<15} "
+        f"{'Nullable':<10} {'Default':<15} {'PK'}"
+    )
     lines.append("-" * 80)
     for col in columns:
         cid, name, col_type, notnull, default_val, pk = col
         nullable = "NO" if notnull else "YES"
         default_str = str(default_val) if default_val is not None else ""
         pk_str = "YES" if pk else ""
-        lines.append(f"{cid:<4} {name:<30} {col_type:<15} {nullable:<10} {default_str:<15} {pk_str}")
+        lines.append(
+            f"{cid:<4} {name:<30} {col_type:<15} "
+            f"{nullable:<10} {default_str:<15} {pk_str}"
+        )
 
     # Also show the CREATE TABLE statement for full context
     create_cursor = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
     )
     create_row = create_cursor.fetchone()
     if create_row and create_row[0]:
@@ -699,35 +953,89 @@ def describe_table(alias: str, table: str) -> str:
 
 
 @mcp.tool()
-def export_query_csv(alias: str, sql: str, params: list[Any] | None = None) -> str:
-    """Run a SELECT query and return results as CSV text.
+def drop_table(alias: str, table: str, confirm: bool = False) -> str:
+    """Drop (delete) a table from the database.
 
-    Useful for exporting data or feeding into other tools.
+    For safety, this shows what would be dropped and requires confirm=True.
+    Call once without confirm to see what will be dropped, then call again
+    with confirm=True to actually drop it.
 
     Args:
         alias: The alias of the database.
-        sql: A SELECT statement.
-        params: Optional bind parameters.
+        table: The name of the table to drop.
+        confirm: Set to True to actually drop the table. Default is False
+                 (preview only).
     """
     conn = _get_conn(alias)
-    params = params or []
+
+    # Check the table exists
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    if not cursor.fetchone():
+        return f"Table '{table}' does not exist."
+
+    # Get info for the confirmation message
+    try:
+        count = conn.execute(
+            f'SELECT COUNT(*) FROM "{table}"'
+        ).fetchone()[0]
+    except sqlite3.Error:
+        count = "?"
 
     try:
-        cursor = conn.execute(sql, params)
+        col_cursor = conn.execute(f'PRAGMA table_info("{table}")')
+        col_names = [row[1] for row in col_cursor.fetchall()]
+    except sqlite3.Error:
+        col_names = []
+
+    if not confirm:
+        return (
+            f"Would drop table '{table}' with {count} rows and "
+            f"{len(col_names)} columns ({', '.join(col_names)}). "
+            f"Call again with confirm=True to proceed."
+        )
+
+    try:
+        conn.execute(f'DROP TABLE "{table}"')
+        conn.commit()
+        log.info("Dropped table '%s' from '%s'", table, alias)
+        return f"Dropped table '{table}' ({count} rows deleted)."
     except sqlite3.Error as exc:
-        return f"SQL error: {exc}"
+        return f"Error dropping table: {exc}"
 
-    if cursor.description is None:
-        return "Statement did not return results."
 
-    columns = [desc[0] for desc in cursor.description]
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(columns)
-    for row in cursor:
-        writer.writerow(row)
+@mcp.tool()
+def rename_table(alias: str, old_name: str, new_name: str) -> str:
+    """Rename a table.
 
-    return output.getvalue()
+    Args:
+        alias: The alias of the database.
+        old_name: Current table name.
+        new_name: New table name.
+    """
+    conn = _get_conn(alias)
+
+    _validate_identifier(new_name, "new table name")
+
+    # Check old table exists
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (old_name,),
+    )
+    if not cursor.fetchone():
+        return f"Table '{old_name}' does not exist."
+
+    try:
+        conn.execute(f'ALTER TABLE "{old_name}" RENAME TO "{new_name}"')
+        conn.commit()
+        log.info(
+            "Renamed table '%s' to '%s' in '%s'", old_name, new_name, alias
+        )
+        return f"Renamed table '{old_name}' to '{new_name}'."
+    except sqlite3.Error as exc:
+        return f"Error renaming table: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +1095,7 @@ After collecting data, useful analysis queries include:
 - WHERE filters to find items matching criteria
 - ORDER BY to rank items
 - JOINs if relationships exist between entities
+- Use `explain_query` if a query is slow to check index usage
 
 Let me open a database and begin the survey."""
 
