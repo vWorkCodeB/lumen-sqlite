@@ -267,4 +267,4 @@ LUMEN_SQLITE_LOG_LEVEL=DEBUG uv run python lumen_sqlite.py
 
 ## License
 
-[MIT](LICENSE)
+Dual-licensed under [MIT](LICENSE) or [Apache-2.0](LICENSE), at your option.
