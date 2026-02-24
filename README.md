@@ -3,6 +3,13 @@
 An MCP server that gives AI language models the ability to create, query, and
 manage structured data using [SQLite](https://www.sqlite.org/).
 
+> **⚠ Trust boundary.** This server is designed for use with databases you
+> create yourself or that come from trusted sources. A database file is
+> essentially a document — its contents flow into the AI's context and could
+> contain adversarial text (prompt injection). Do not point this server at
+> untrusted databases without reviewing the [Safety](#safety) section.
+> In untrusted environments, enable **sandbox mode** (`LUMEN_SQLITE_SANDBOX=1`).
+
 ## Why would an AI want a database?
 
 Language models are great at reasoning over text, but some problems are easier
