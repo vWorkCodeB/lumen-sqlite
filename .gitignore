@@ -13,3 +13,6 @@ build/
 *.db-shm
 *.db-wal
 *.db-journal
+
+target/
+.vscode/

@@ -1,0 +1,20 @@
+[package]
+name = "lumen-sqlite-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "An MCP server for storing and manipulating structured data using SQLite"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+csv = "1"
+glob = "0.3"
+rmcp = { version = "1.2.0", features = ["server", "transport-io", "schemars"] }
+rusqlite = { version = "0.39.0", features = ["bundled-full"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
