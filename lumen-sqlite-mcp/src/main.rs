@@ -697,7 +697,7 @@ pub struct AddColumnParams {
 
 #[tool_router]
 impl LumenSqlite {
-    #[tool(description = "Open (or create) a SQLite database file.")]
+    #[tool(description = "Open or create a SQLite database file and assign it an alias (defaults to the file stem). Creates the file if it does not exist.")]
     async fn open_database(&self, params: Parameters<OpenDatabaseParams>) -> String {
         let params = params.0;
         let db_path = match self.resolve_db_path(&params.path) {
@@ -1086,7 +1086,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Execute a single SQL statement. Returns results for SELECT, or affected row count for INSERT/UPDATE/DELETE/DDL. Use ? placeholders with params for safety. Supports pagination via offset+max_rows: if the response says more rows are available, call again with offset incremented by the number of rows returned.")]
+    #[tool(description = "Execute a single SQL statement. SELECT returns rows; INSERT/UPDATE/DELETE/DDL returns affected row count. Use ? placeholders with params to prevent injection. Paginate with offset+max_rows — increment offset by rows returned when response says more are available. TRAP: cannot span transactions — BEGIN in one call then COMMIT in another has no effect; use execute_script for manual transactions or bulk_insert for row batches.")]
     async fn execute_sql(&self, params: Parameters<ExecuteSqlParams>) -> String {
         let ExecuteSqlParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
@@ -1180,7 +1180,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Execute multiple SQL statements in a single call. Use for schema setup (CREATE TABLE, CREATE INDEX) or batch operations. Statements are separated by semicolons. Does not support parameter binding.")]
+    #[tool(description = "Execute multiple semicolon-separated SQL statements in one call. Use for schema setup (CREATE TABLE, CREATE INDEX) or when you need manual transaction control (BEGIN; …; COMMIT). No parameter binding — never interpolate untrusted values into the script; use execute_sql with params for that.")]
     async fn execute_script(&self, params: Parameters<ExecuteScriptParams>) -> String {
         let ExecuteScriptParams { alias, script } = params.0;
         let conns = self.connections.lock().unwrap();
@@ -1235,7 +1235,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Insert many rows into a table in a single transaction-wrapped call. Typically 50-100x faster than individual INSERT calls for large batches. Use conflict='replace' for upsert (INSERT OR REPLACE) or conflict='ignore' to skip duplicate-key rows silently.")]
+    #[tool(description = "Insert many rows into a pre-existing table in one transaction. 50-100x faster than repeated execute_sql INSERTs. Table must already exist — create it with execute_sql first if needed. conflict: 'error' (default, rolls back batch on violation), 'replace' (upsert), 'ignore' (skip violating rows silently).")]
     async fn bulk_insert(&self, params: Parameters<BulkInsertParams>) -> String {
         let BulkInsertParams { alias, table, columns, rows, conflict } = params.0;
         let conflict_kw = match conflict.as_deref().unwrap_or("error") {
@@ -1298,7 +1298,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Import CSV text into a table. If the table does not exist, it is created automatically from the header row with inferred column types. All rows inserted in a single transaction.")]
+    #[tool(description = "Import inline CSV text into a table. Table auto-created from the header row with inferred types if absent. if_exists: 'error' (default), 'replace' (drop+recreate), 'append'. For large datasets, prefer import_csv_file to avoid oversized arguments.")]
     async fn import_csv(&self, params: Parameters<ImportCsvParams>) -> String {
         let ImportCsvParams { alias, csv_text, table, if_exists } = params.0;
         let table = table.unwrap_or_else(|| "imported".to_string());
@@ -1409,7 +1409,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as CSV text. Supports pagination via offset+max_rows: if a status comment at the end says more rows are available, call again with offset incremented by the number of rows returned.")]
+    #[tool(description = "Run a SELECT query and return results as CSV text. Paginate with offset+max_rows — increment offset by rows returned when the response indicates more are available.")]
     async fn export_query_csv(&self, params: Parameters<ExportQueryCsvParams>) -> String {
         let ExportQueryCsvParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
@@ -1560,7 +1560,7 @@ impl LumenSqlite {
         out
     }
 
-    #[tool(description = "Import a CSV or TSV file from disk into a database table. Supports files with or without header rows. When has_headers is false, supply column names via the 'columns' parameter. Prefer this over import_csv for large files.")]
+    #[tool(description = "Import a CSV or TSV file from disk into a table. Delimiter auto-detected (.tsv→tab, others→comma). Table auto-created with inferred types if absent. IMPORTANT: if_exists defaults to 'error' — pass 'replace' to overwrite or 'append' to extend. Supply columns when has_headers=false.")]
     async fn import_csv_file(&self, params: Parameters<ImportCsvFileParams>) -> String {
         let ImportCsvFileParams { alias, path, table, has_headers, columns, delimiter, if_exists } = params.0;
         let has_headers = has_headers.unwrap_or(true);
@@ -1782,7 +1782,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Import a JSON array of objects (inline text) into a table. Column types are inferred from the JSON value types. All rows inserted in a single transaction.")]
+    #[tool(description = "Import an inline JSON array of objects into a table. Table auto-created with types inferred from JSON values if absent. if_exists: 'error' (default), 'replace', 'append'. For large JSON, use import_json_file instead.")]
     async fn import_json(&self, params: Parameters<ImportJsonParams>) -> String {
         let ImportJsonParams { alias, json_text, table, if_exists } = params.0;
         let table = table.unwrap_or_else(|| "imported".to_string());
@@ -1817,7 +1817,7 @@ impl LumenSqlite {
         import_json_objects(&self.connections, &alias, &table, &if_exists, &col_names, &arr)
     }
 
-    #[tool(description = "Import a JSON file (array of objects or NDJSON) into a table. Column types are inferred from JSON value types. All rows inserted in a single transaction.")]
+    #[tool(description = "Import a JSON file into a table. format: 'array' (default, JSON array of objects) or 'ndjson' (one object per line, good for large files). if_exists: 'error' (default), 'replace', 'append'. Table auto-created with inferred types if absent.")]
     async fn import_json_file(&self, params: Parameters<ImportJsonFileParams>) -> String {
         let ImportJsonFileParams { alias, path, table, format, if_exists } = params.0;
         let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
@@ -1986,7 +1986,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as a Markdown table, ready for display in chat. Column widths are automatically padded for alignment. Supports pagination via offset+max_rows: if the footer says more rows are available, call again with offset incremented by the number of rows returned.")]
+    #[tool(description = "Run a SELECT query and return results as a Markdown table for display in chat. Pipe characters in cells are auto-escaped. Paginate with offset+max_rows the same way as execute_sql.")]
     async fn export_query_markdown(&self, params: Parameters<ExportQueryMarkdownParams>) -> String {
         let ExportQueryMarkdownParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
@@ -2192,7 +2192,7 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Attach another SQLite database file to an open connection. Its tables become accessible as schema_name.table_name in subsequent queries on that connection, enabling cross-database JOINs without copying data.")]
+    #[tool(description = "Attach a second SQLite file to an open connection. Its tables become accessible as schema_name.table_name for cross-database JOINs and copies. No new alias is created — all queries run on the main alias. Call detach_database when done to release the file lock.")]
     async fn attach_database(&self, params: Parameters<AttachDatabaseParams>) -> String {
         let AttachDatabaseParams { alias, path, schema_name } = params.0;
         if let Err(e) = validate_identifier(&schema_name, "schema name") {
@@ -2223,7 +2223,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Detach a previously attached database schema from a connection.")]
+    #[tool(description = "Remove a previously attached schema from a connection and release its file lock. Does not close the main connection or delete any files.")]
     async fn detach_database(&self, params: Parameters<DetachDatabaseParams>) -> String {
         let DetachDatabaseParams { alias, schema_name } = params.0;
         if let Err(e) = validate_identifier(&schema_name, "schema name") {
@@ -2244,7 +2244,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Create an index on a table. Auto-generates a name if not provided. Supports UNIQUE indexes and partial indexes via where_clause.")]
+    #[tool(description = "Create an index to speed up WHERE, JOIN, and ORDER BY on the indexed columns. Name auto-generated as idx_table_col1_col2 if omitted. unique=true enforces uniqueness. where_clause creates a partial (filtered) index. Use explain_query to verify index usage.")]
     async fn create_index(&self, params: Parameters<CreateIndexParams>) -> String {
         let CreateIndexParams { alias, table, columns, index_name, unique, where_clause, if_not_exists } = params.0;
         let unique = unique.unwrap_or(false);
@@ -2295,7 +2295,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Drop an index. Call without confirm to preview (shows table and DDL). Call again with confirm=true to actually drop.")]
+    #[tool(description = "Drop an index. Never deletes data — only removes the index structure. Call without confirm to preview (table name, DDL). Call with confirm=true to execute.")]
     async fn drop_index(&self, params: Parameters<DropIndexParams>) -> String {
         let DropIndexParams { alias, index_name, confirm } = params.0;
         let confirm = confirm.unwrap_or(false);
@@ -2379,7 +2379,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "List all tables in the database.")]
+    #[tool(description = "List all user tables. Prefer database_info for a full overview including row counts, column schemas, and indexes.")]
     async fn list_tables(&self, params: Parameters<AliasParams>) -> String {
         let alias = params.0.alias;
         let conns = self.connections.lock().unwrap();
@@ -2403,7 +2403,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Show the schema of a table: column names, types, constraints, and the CREATE TABLE DDL.")]
+    #[tool(description = "Show a table's column definitions (names, types, constraints, DDL) and all its indexes. Prefer database_info for a multi-table overview.")]
     async fn describe_table(&self, params: Parameters<TableParams>) -> String {
         let TableParams { alias, table } = params.0;
         let conns = self.connections.lock().unwrap();
@@ -2523,7 +2523,7 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Drop a table from the database. For safety, call first without confirm to see a preview (row count, columns), then again with confirm=true to actually drop the table.")]
+    #[tool(description = "Drop a table permanently. Call without confirm to preview (row count, columns). Call with confirm=true to execute. Irreversible — verify you no longer need the data before confirming.")]
     async fn drop_table(&self, params: Parameters<DropTableParams>) -> String {
         let DropTableParams { alias, table, confirm } = params.0;
         let confirm = confirm.unwrap_or(false);
@@ -2581,7 +2581,7 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Rename a table via ALTER TABLE ... RENAME TO.")]
+    #[tool(description = "Rename a table in place. All data, indexes, and triggers are preserved.")]
     async fn rename_table(&self, params: Parameters<RenameTableParams>) -> String {
         let RenameTableParams { alias, old_name, new_name } = params.0;
 
