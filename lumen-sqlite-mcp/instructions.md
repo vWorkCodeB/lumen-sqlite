@@ -154,6 +154,15 @@ execute_script or bulk_insert when you need transactional behavior.
 - GROUP_CONCAT aggregates multiple values into a delimited string.
 - The || operator concatenates strings.
 - LIKE is case-insensitive for ASCII. Use GLOB for case-sensitive matching.
+- **REGEXP is available** on every connection: `text REGEXP pattern` returns
+  1 if the Rust regex matches anywhere in text, 0 otherwise. The pattern
+  argument is first, the text argument is second (standard SQLite convention).
+  Examples:
+    - `WHERE name REGEXP '^clang-'`  — names starting with "clang-"
+    - `WHERE path REGEXP '\d{4}'`    — paths containing a 4-digit run
+    - `WHERE msg REGEXP '(?i)error'` — case-insensitive match
+  To negate: `WHERE NOT (name REGEXP 'pattern')` or `WHERE name REGEXP pattern = 0`.
+  NULL input yields 0. An invalid pattern raises a SQL error.
 - CTEs (WITH ... AS) are excellent for readable complex queries.
 - Window functions (ROW_NUMBER, RANK, LAG, LEAD, SUM OVER) are supported.
 - Full-text search (FTS5) is available via CREATE VIRTUAL TABLE.

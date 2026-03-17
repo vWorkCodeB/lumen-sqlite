@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use csv as csv_crate;
+use regex::Regex;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -367,6 +368,32 @@ impl LumenSqlite {
 
         // Enable WAL mode and foreign keys
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+
+        // Register REGEXP scalar function: text REGEXP pattern
+        // Returns 1 if pattern matches anywhere in text, 0 otherwise.
+        // NULL input yields NULL. Invalid patterns return an error.
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern: Option<String> = ctx.get(0)?;
+                let text: Option<String> = ctx.get(1)?;
+                match (pattern, text) {
+                    (Some(pat), Some(txt)) => {
+                        let re = Regex::new(&pat).map_err(|e| {
+                            rusqlite::Error::UserFunctionError(Box::new(
+                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                            ))
+                        })?;
+                        Ok(re.is_match(&txt) as i64)
+                    }
+                    _ => Ok(0i64),
+                }
+            },
+        ).map_err(|e| format!("Failed to register regexp UDF: {e}"))
+         .unwrap_or(());
 
         let verb = if creating {
             "Created and opened"
