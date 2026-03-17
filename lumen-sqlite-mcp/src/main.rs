@@ -458,6 +458,9 @@ pub struct BulkInsertParams {
     pub columns: Vec<String>,
     /// List of rows, each row being a list of values matching the columns.
     pub rows: Vec<Vec<serde_json::Value>>,
+    /// Conflict resolution: "error" (default), "replace" (INSERT OR REPLACE),
+    /// "ignore" (INSERT OR IGNORE — skips rows that violate a constraint).
+    pub conflict: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -614,6 +617,78 @@ pub struct ExportQueryMarkdownParams {
     pub max_rows: Option<usize>,
     /// Row offset for pagination (default: 0).
     pub offset: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TableStatsParams {
+    /// The alias of the database.
+    pub alias: String,
+    /// The table to profile.
+    pub table: String,
+    /// Optional subset of columns to include. Defaults to all columns.
+    pub columns: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AttachDatabaseParams {
+    /// The alias of the already-open database whose connection will run ATTACH.
+    pub alias: String,
+    /// Path to the SQLite database file to attach (absolute or relative to db_dir).
+    pub path: String,
+    /// Schema name to use in SQL (e.g. "other" → SELECT * FROM "other".my_table).
+    pub schema_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DetachDatabaseParams {
+    /// The alias of the database connection from which to detach.
+    pub alias: String,
+    /// The schema name to detach (as given to attach_database).
+    pub schema_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateIndexParams {
+    /// The alias of the database.
+    pub alias: String,
+    /// The table to index.
+    pub table: String,
+    /// Columns to include in the index, in order.
+    pub columns: Vec<String>,
+    /// Index name. Auto-generated as idx_table_col1_col2 if not provided.
+    pub index_name: Option<String>,
+    /// Whether to create a UNIQUE index (default: false).
+    pub unique: Option<bool>,
+    /// Optional WHERE clause for a partial index (e.g. "status = 'active'").
+    pub where_clause: Option<String>,
+    /// Use IF NOT EXISTS (default: false).
+    pub if_not_exists: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DropIndexParams {
+    /// The alias of the database.
+    pub alias: String,
+    /// The name of the index to drop.
+    pub index_name: String,
+    /// Set to true to actually drop. Default false shows a preview.
+    pub confirm: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AddColumnParams {
+    /// The alias of the database.
+    pub alias: String,
+    /// The table to alter.
+    pub table: String,
+    /// Name of the new column.
+    pub column: String,
+    /// SQLite column type (default: TEXT). Use INTEGER, REAL, BLOB, or TEXT.
+    pub col_type: Option<String>,
+    /// Whether the column is NOT NULL (default: false). Requires default_value.
+    pub not_null: Option<bool>,
+    /// Default value expression (e.g. "0", "'unknown'", "datetime('now')").
+    pub default_value: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,9 +1235,14 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Insert many rows into a table in a single transaction-wrapped call. Typically 50-100x faster than individual INSERT calls for large batches.")]
+    #[tool(description = "Insert many rows into a table in a single transaction-wrapped call. Typically 50-100x faster than individual INSERT calls for large batches. Use conflict='replace' for upsert (INSERT OR REPLACE) or conflict='ignore' to skip duplicate-key rows silently.")]
     async fn bulk_insert(&self, params: Parameters<BulkInsertParams>) -> String {
-        let BulkInsertParams { alias, table, columns, rows } = params.0;
+        let BulkInsertParams { alias, table, columns, rows, conflict } = params.0;
+        let conflict_kw = match conflict.as_deref().unwrap_or("error") {
+            "replace" => "OR REPLACE ",
+            "ignore"  => "OR IGNORE ",
+            _         => "",
+        };
 
         if rows.is_empty() {
             return "No rows to insert.".to_string();
@@ -1185,7 +1265,7 @@ impl LumenSqlite {
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("INSERT INTO \"{}\" ({col_clause}) VALUES ({placeholders})", escape_identifier(&table));
+        let sql = format!("INSERT {conflict_kw}INTO \"{}\" ({col_clause}) VALUES ({placeholders})", escape_identifier(&table));
 
         let conns = self.connections.lock().unwrap();
         let db = match conns.get(&alias) {
@@ -2019,6 +2099,286 @@ impl LumenSqlite {
         out
     }
 
+    #[tool(description = "Profile a table: row count, NULL count, distinct count, min/max, and avg per column. A one-call replacement for many exploratory SELECT queries on an unfamiliar dataset.")]
+    async fn table_stats(&self, params: Parameters<TableStatsParams>) -> String {
+        let TableStatsParams { alias, table, columns } = params.0;
+        if let Err(e) = validate_identifier(&table, "table name") {
+            return e;
+        }
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let safe_table = escape_identifier(&table);
+
+        let all_cols: Vec<(String, String)> = {
+            let mut stmt = db.conn.prepare(&format!("PRAGMA table_info(\"{safe_table}\")")).ok();
+            stmt.as_mut().and_then(|s| {
+                s.query_map([], |row| Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))).ok().map(|m| m.flatten().collect())
+            }).unwrap_or_default()
+        };
+
+        if all_cols.is_empty() {
+            return format!("Table '{table}' not found.");
+        }
+
+        let col_info: Vec<(String, String)> = if let Some(requested) = columns {
+            all_cols.into_iter().filter(|(n, _)| requested.contains(n)).collect()
+        } else {
+            all_cols
+        };
+
+        let total_rows: i64 = match db.conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{safe_table}\""),
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(n) => n,
+            Err(e) => return format!("Error counting rows: {e}"),
+        };
+
+        let mut lines = vec![
+            format!("Table: {table}"),
+            format!("Total rows: {total_rows}"),
+        ];
+
+        for (col_name, col_type) in &col_info {
+            let safe_col = escape_identifier(col_name);
+            let stats: Option<(i64, i64, Option<String>, Option<String>, Option<f64>)> =
+                db.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(\"{safe_col}\"), COUNT(DISTINCT \"{safe_col}\"), \
+                         CAST(MIN(\"{safe_col}\") AS TEXT), CAST(MAX(\"{safe_col}\") AS TEXT), \
+                         AVG(CAST(\"{safe_col}\" AS REAL)) FROM \"{safe_table}\""
+                    ),
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                    )),
+                ).ok();
+
+            lines.push(String::new());
+            if let Some((non_null, distinct, min_val, max_val, avg_val)) = stats {
+                let null_count = total_rows - non_null;
+                let type_str = if col_type.is_empty() { "?".to_string() } else { col_type.clone() };
+                let null_str = if null_count == 0 {
+                    "0 nulls".to_string()
+                } else {
+                    format!("{null_count} nulls ({:.1}%)", null_count as f64 / total_rows as f64 * 100.0)
+                };
+                let min_str = min_val.as_deref().unwrap_or("NULL");
+                let max_str = max_val.as_deref().unwrap_or("NULL");
+                let min_d = if min_str.len() > 30 { format!("{}...", &min_str[..30]) } else { min_str.to_string() };
+                let max_d = if max_str.len() > 30 { format!("{}...", &max_str[..30]) } else { max_str.to_string() };
+                lines.push(format!("  {col_name}  [{type_str}]  non_null: {non_null}  {null_str}  distinct: {distinct}"));
+                lines.push(format!("    min: {min_d}  max: {max_d}"));
+                if let Some(avg) = avg_val {
+                    lines.push(format!("    avg: {avg:.4}"));
+                }
+            } else {
+                lines.push(format!("  {col_name}  (error reading stats)"));
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    #[tool(description = "Attach another SQLite database file to an open connection. Its tables become accessible as schema_name.table_name in subsequent queries on that connection, enabling cross-database JOINs without copying data.")]
+    async fn attach_database(&self, params: Parameters<AttachDatabaseParams>) -> String {
+        let AttachDatabaseParams { alias, path, schema_name } = params.0;
+        if let Err(e) = validate_identifier(&schema_name, "schema name") {
+            return e;
+        }
+        let file_path = match self.resolve_db_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+        let path_str = file_path.to_string_lossy().replace('\'', "''");
+        let safe_schema = escape_identifier(&schema_name);
+        let sql = format!("ATTACH DATABASE '{path_str}' AS \"{safe_schema}\"");
+        match db.conn.execute_batch(&sql) {
+            Ok(()) => {
+                info!("Attached '{}' as schema '{schema_name}' on '{alias}'", file_path.display());
+                format!(
+                    "Attached '{}' as schema '{schema_name}'. \
+                     Tables are accessible as \"{schema_name}\".table_name in queries.",
+                    file_path.display()
+                )
+            }
+            Err(e) => format!("ATTACH error: {e}"),
+        }
+    }
+
+    #[tool(description = "Detach a previously attached database schema from a connection.")]
+    async fn detach_database(&self, params: Parameters<DetachDatabaseParams>) -> String {
+        let DetachDatabaseParams { alias, schema_name } = params.0;
+        if let Err(e) = validate_identifier(&schema_name, "schema name") {
+            return e;
+        }
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+        let safe_schema = escape_identifier(&schema_name);
+        match db.conn.execute_batch(&format!("DETACH DATABASE \"{safe_schema}\"")) {
+            Ok(()) => {
+                info!("Detached schema '{schema_name}' from '{alias}'");
+                format!("Detached schema '{schema_name}'.")
+            }
+            Err(e) => format!("DETACH error: {e}"),
+        }
+    }
+
+    #[tool(description = "Create an index on a table. Auto-generates a name if not provided. Supports UNIQUE indexes and partial indexes via where_clause.")]
+    async fn create_index(&self, params: Parameters<CreateIndexParams>) -> String {
+        let CreateIndexParams { alias, table, columns, index_name, unique, where_clause, if_not_exists } = params.0;
+        let unique = unique.unwrap_or(false);
+        let if_not_exists = if_not_exists.unwrap_or(false);
+
+        if let Err(e) = validate_identifier(&table, "table name") { return e; }
+        if columns.is_empty() { return "At least one column is required.".to_string(); }
+        for col in &columns {
+            if let Err(e) = validate_identifier(col, "column name") { return e; }
+        }
+
+        let idx_name = match index_name {
+            Some(n) => n,
+            None => format!("idx_{}_{}", table, columns.join("_")),
+        };
+        if let Err(e) = validate_identifier(&idx_name, "index name") { return e; }
+
+        let unique_kw = if unique { "UNIQUE " } else { "" };
+        let ine_kw = if if_not_exists { "IF NOT EXISTS " } else { "" };
+        let col_list = columns.iter()
+            .map(|c| format!("\"{}\"", escape_identifier(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let where_part = where_clause.as_deref()
+            .map(|w| format!(" WHERE {w}"))
+            .unwrap_or_default();
+        let sql = format!(
+            "CREATE {unique_kw}INDEX {ine_kw}\"{}\" ON \"{}\" ({col_list}){where_part}",
+            escape_identifier(&idx_name),
+            escape_identifier(&table),
+        );
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+        match db.conn.execute_batch(&sql) {
+            Ok(()) => {
+                info!("Created index '{idx_name}' on '{alias}.{table}'");
+                let kind = if unique { "UNIQUE INDEX" } else { "INDEX" };
+                format!(
+                    "Created {kind} '{idx_name}' on '{table}' ({}).{where_part}",
+                    columns.join(", ")
+                )
+            }
+            Err(e) => format!("CREATE INDEX error: {e}"),
+        }
+    }
+
+    #[tool(description = "Drop an index. Call without confirm to preview (shows table and DDL). Call again with confirm=true to actually drop.")]
+    async fn drop_index(&self, params: Parameters<DropIndexParams>) -> String {
+        let DropIndexParams { alias, index_name, confirm } = params.0;
+        let confirm = confirm.unwrap_or(false);
+
+        if let Err(e) = validate_identifier(&index_name, "index name") { return e; }
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let info: Option<(String, Option<String>)> = db.conn.query_row(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?1",
+            rusqlite::params![index_name],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            )),
+        ).ok();
+
+        let (tbl_name, idx_ddl) = match info {
+            Some(i) => i,
+            None => return format!("Index '{index_name}' not found."),
+        };
+
+        if !confirm {
+            let ddl_line = idx_ddl.as_deref().unwrap_or("(auto-generated — no stored DDL)");
+            return format!(
+                "Preview: DROP INDEX '{index_name}' on table '{tbl_name}'\nDDL: {ddl_line}\nCall again with confirm=true to drop."
+            );
+        }
+
+        let safe_idx = escape_identifier(&index_name);
+        match db.conn.execute_batch(&format!("DROP INDEX \"{safe_idx}\"")) {
+            Ok(()) => {
+                info!("Dropped index '{index_name}' from '{alias}.{tbl_name}'");
+                format!("Dropped index '{index_name}' (was on table '{tbl_name}').")
+            }
+            Err(e) => format!("DROP INDEX error: {e}"),
+        }
+    }
+
+    #[tool(description = "Add a column to an existing table (ALTER TABLE ... ADD COLUMN). Defaults to TEXT type. NOT NULL requires a default_value (SQLite restriction).")]
+    async fn add_column(&self, params: Parameters<AddColumnParams>) -> String {
+        let AddColumnParams { alias, table, column, col_type, not_null, default_value } = params.0;
+        let col_type = col_type.unwrap_or_else(|| "TEXT".to_string());
+        let not_null = not_null.unwrap_or(false);
+
+        if let Err(e) = validate_identifier(&table, "table name") { return e; }
+        if let Err(e) = validate_identifier(&column, "column name") { return e; }
+
+        if not_null && default_value.is_none() {
+            return "NOT NULL requires a default_value (SQLite requires a non-null default \
+                    for columns added via ALTER TABLE ADD COLUMN).".to_string();
+        }
+
+        let safe_table = escape_identifier(&table);
+        let safe_col = escape_identifier(&column);
+        let mut sql = format!("ALTER TABLE \"{safe_table}\" ADD COLUMN \"{safe_col}\" {col_type}");
+        if not_null { sql.push_str(" NOT NULL"); }
+        if let Some(ref def) = default_value {
+            sql.push_str(&format!(" DEFAULT {def}"));
+        }
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+        match db.conn.execute_batch(&sql) {
+            Ok(()) => {
+                info!("Added column '{column}' ({col_type}) to '{alias}.{table}'");
+                let mut desc = format!("Added column '{column}' ({col_type})");
+                if not_null { desc.push_str(" NOT NULL"); }
+                if let Some(ref def) = default_value { desc.push_str(&format!(" DEFAULT {def}")); }
+                desc.push_str(&format!(" to table '{table}'."));
+                desc
+            }
+            Err(e) => format!("ADD COLUMN error: {e}"),
+        }
+    }
+
     #[tool(description = "List all tables in the database.")]
     async fn list_tables(&self, params: Parameters<AliasParams>) -> String {
         let alias = params.0.alias;
@@ -2306,6 +2666,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 

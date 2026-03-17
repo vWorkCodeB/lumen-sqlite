@@ -1,0 +1,11 @@
+symbol	name	atomic_num	atomic_weight	category
+H	Hydrogen	1	1.008	nonmetal
+He	Helium	2	4.0026	noble gas
+Li	Lithium	3	6.94	alkali metal
+Be	Beryllium	4	9.0122	alkaline earth
+B	Boron	5	10.81	metalloid
+C	Carbon	6	12.011	nonmetal
+N	Nitrogen	7	14.007	nonmetal
+O	Oxygen	8	15.999	nonmetal
+F	Fluorine	9	18.998	halogen
+Ne	Neon	10	20.18	noble gas

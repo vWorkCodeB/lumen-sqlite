@@ -117,6 +117,26 @@ the number of rows returned each time, until you see "end of results".
 - **drop_table** — Drop a table. Returns a preview of what will be dropped
   (row count, columns) so you can confirm before proceeding.
 - **rename_table** — Rename a table via ALTER TABLE ... RENAME TO.
+- **add_column** — Add a column to an existing table via `ALTER TABLE ... ADD
+  COLUMN`. Defaults to TEXT type. NOT NULL columns require a `default_value`
+  (SQLite restriction: you cannot add a NOT NULL column without a default).
+
+## Index management
+
+- **create_index** — Create a standard or UNIQUE index on one or more columns.
+  Auto-generates a name (`idx_table_col1_col2`) if `index_name` is omitted.
+  Supports partial indexes via `where_clause` (e.g. `"status = 'active'"`)
+  and `if_not_exists` to suppress errors on re-runs.
+- **drop_index** — Drop an index. Call without `confirm` to preview (shows
+  which table the index belongs to and its original DDL). Call again with
+  `confirm=true` to actually drop. Pattern mirrors `drop_table`.
+
+## Table profiling
+
+- **table_stats** — One-call column profile: total row count, non-null count,
+  null count (with %), distinct count, min, max, and avg per column. Useful
+  for understanding a new dataset without writing exploratory queries.
+  Pass `columns` to limit the profile to a subset of columns.
 
 ## Index visibility
 
@@ -162,6 +182,15 @@ Pattern using execute_script:
 
 Or better, use the **bulk_insert** tool, which handles the transaction
 wrapping automatically and uses parameterized queries for safety.
+
+**bulk_insert conflict modes** — The optional `conflict` parameter controls
+how constraint violations are handled:
+
+- `"error"` (default) — raises an error and rolls back the whole batch.
+- `"replace"` — `INSERT OR REPLACE`: replaces existing rows with the same
+  primary key (upsert).
+- `"ignore"` — `INSERT OR IGNORE`: silently skips rows that violate any
+  constraint.
 
 Do **not** try to manage transactions manually through execute_sql.
 execute_sql auto-commits after each call, so BEGIN TRANSACTION followed by
@@ -331,6 +360,18 @@ Parameters:
 
 Use this instead of `execute_sql` when you want results that render nicely
 in the conversation rather than as raw tab-separated text.
+
+## Cross-database queries
+
+- **attach_database** — Attach a second SQLite file to an open connection.
+  Tables in the attached database are accessible as `schema_name.table_name`
+  in all SQL executed on that connection. Use this for cross-database JOINs
+  or to copy rows between files without a separate open_database call.
+  Example: `SELECT a.*, b.extra FROM main.items a JOIN other.details b ON a.id = b.id`
+- **detach_database** — Detach a previously attached schema.
+
+Attached files are subject to the same extension restrictions and sandbox
+rules as files opened with `open_database`.
 
 ## Sandbox mode
 

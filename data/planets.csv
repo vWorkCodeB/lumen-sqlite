@@ -1,0 +1,9 @@
+name,diameter_km,mass_earths,has_rings,dist_au
+Mercury,4879,0.055,false,0.39
+Venus,12104,0.815,false,0.72
+Earth,12742,1.0,false,1.0
+Mars,6779,0.107,false,1.52
+Jupiter,139820,317.8,true,5.2
+Saturn,116460,95.2,true,9.58
+Uranus,50724,14.5,true,19.2
+Neptune,49244,17.1,true,30.05
