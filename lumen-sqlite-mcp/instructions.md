@@ -85,6 +85,24 @@ A helper function `create_readme` is available as a tool; prefer using it.
    automatically (see "File-based CSV/TSV tools" section below).
 10. **close_database** — When you're done. Open databases consume resources.
 
+## Pagination
+
+`execute_sql`, `export_query_csv`, and `export_query_markdown` all support
+stateless offset pagination via two parameters:
+
+- `max_rows` — page size (default: 500 for `execute_sql`/`export_query_markdown`,
+  10000 for `export_query_csv`)
+- `offset` — number of rows to skip before the page starts (default: 0)
+
+The response always includes a status line indicating the row range:
+
+- If more rows are available: `(Rows 1-500, more available. Call again with offset=500.)`
+- On the last page: `(Rows 501-743.)` or `_(Rows 501-743, end of results.)_`
+- Past the end: `(No rows at offset 800 -- past end of results.)`
+
+To page through a full result set, call repeatedly, incrementing `offset` by
+the number of rows returned each time, until you see "end of results".
+
 ## Discovering databases
 
 - **list_databases** — Shows currently open databases.

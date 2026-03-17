@@ -423,8 +423,11 @@ pub struct ExecuteSqlParams {
     pub sql: String,
     /// Optional list of bind parameters (for parameterized queries using ? placeholders).
     pub params: Option<Vec<serde_json::Value>>,
-    /// Maximum rows to return (default: from env or 500).
+    /// Maximum rows to return per page (default: from env or 500).
     pub max_rows: Option<usize>,
+    /// Row offset for pagination (default: 0). If the response says more rows are available,
+    /// call again with offset incremented by the number of rows returned.
+    pub offset: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -477,8 +480,10 @@ pub struct ExportQueryCsvParams {
     pub sql: String,
     /// Optional bind parameters.
     pub params: Option<Vec<serde_json::Value>>,
-    /// Maximum rows to export (default: 10000). Set 0 for unlimited.
+    /// Maximum rows to export per page (default: 10000).
     pub max_rows: Option<usize>,
+    /// Row offset for pagination (default: 0).
+    pub offset: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -605,8 +610,10 @@ pub struct ExportQueryMarkdownParams {
     pub sql: String,
     /// Optional bind parameters for the query.
     pub params: Option<Vec<serde_json::Value>>,
-    /// Maximum rows to return (default: from env or 500).
+    /// Maximum rows to return per page (default: from env or 500).
     pub max_rows: Option<usize>,
+    /// Row offset for pagination (default: 0).
+    pub offset: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -981,10 +988,11 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Execute a single SQL statement. Returns results for SELECT, or affected row count for INSERT/UPDATE/DELETE/DDL. Use ? placeholders with params for safety.")]
+    #[tool(description = "Execute a single SQL statement. Returns results for SELECT, or affected row count for INSERT/UPDATE/DELETE/DDL. Use ? placeholders with params for safety. Supports pagination via offset+max_rows: if the response says more rows are available, call again with offset incremented by the number of rows returned.")]
     async fn execute_sql(&self, params: Parameters<ExecuteSqlParams>) -> String {
-        let ExecuteSqlParams { alias, sql, params: bind_params, max_rows } = params.0;
+        let ExecuteSqlParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
+        let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
         let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
 
@@ -1019,7 +1027,13 @@ impl LumenSqlite {
                 })
                 .and_then(|mapped| {
                     let mut collected = Vec::new();
+                    let mut skipped = 0usize;
                     for r in mapped {
+                        if skipped < offset {
+                            let _ = r?;
+                            skipped += 1;
+                            continue;
+                        }
                         collected.push(r?);
                         if collected.len() >= max_rows + 1 {
                             break;
@@ -1031,18 +1045,32 @@ impl LumenSqlite {
             match rows_result {
                 Err(e) => format!("SQL error: {e}"),
                 Ok(mut rows) => {
-                    let truncated = rows.len() > max_rows;
-                    if truncated {
+                    let has_more = rows.len() > max_rows;
+                    if has_more {
                         rows.pop();
                     }
-                    let mut lines = vec![col_names.join("\t")];
+                    if rows.is_empty() {
+                        return if offset > 0 {
+                            format!("(No rows at offset {offset} -- past end of results.)")
+                        } else {
+                            "(no rows)".to_string()
+                        };
+                    }
+                    let start = offset + 1;
+                    let end = offset + rows.len();
+                    let status = if has_more {
+                        format!("(Rows {start}-{end}, more available. Call again with offset={end}.)")
+                    } else {
+                        format!("(Rows {start}-{end}.)")
+                    };
+                    let mut out = status;
+                    out.push('\n');
+                    out.push_str(&col_names.join("\t"));
                     for row in &rows {
-                        lines.push(row.join("\t"));
+                        out.push('\n');
+                        out.push_str(&row.join("\t"));
                     }
-                    if truncated {
-                        lines.push(format!("... (results truncated at {} rows)", rows.len()));
-                    }
-                    lines.join("\n")
+                    out
                 }
             }
         } else {
@@ -1278,10 +1306,11 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as CSV text. Useful for exporting data or feeding into other tools.")]
+    #[tool(description = "Run a SELECT query and return results as CSV text. Supports pagination via offset+max_rows: if a status comment at the end says more rows are available, call again with offset incremented by the number of rows returned.")]
     async fn export_query_csv(&self, params: Parameters<ExportQueryCsvParams>) -> String {
-        let ExportQueryCsvParams { alias, sql, params: bind_params, max_rows } = params.0;
+        let ExportQueryCsvParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
+        let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
         let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
 
@@ -1323,9 +1352,14 @@ impl LumenSqlite {
             })
             .and_then(|mapped| {
                 let mut count = 0usize;
+                let mut skipped = 0usize;
                 let mut truncated = false;
                 for row in mapped {
                     let r = row?;
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
                     if max_rows > 0 && count >= max_rows {
                         truncated = true;
                         break;
@@ -1344,10 +1378,16 @@ impl LumenSqlite {
 
         match rows_result {
             Err(e) => format!("SQL error: {e}"),
-            Ok((_count, truncated)) => {
+            Ok((count, truncated)) => {
                 let mut csv_text = String::from_utf8_lossy(&output).into_owned();
                 if truncated {
-                    csv_text.push_str(&format!("\n# ... truncated at {max_rows} rows\n"));
+                    let start = offset + 1;
+                    let end = offset + count;
+                    csv_text.push_str(&format!("\n# Rows {start}-{end}, more available. Call again with offset={end}.\n"));
+                } else if offset > 0 {
+                    let start = offset + 1;
+                    let end = offset + count;
+                    csv_text.push_str(&format!("\n# Rows {start}-{end}, end of results.\n"));
                 }
                 csv_text
             }
@@ -1843,10 +1883,11 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as a Markdown table, ready for display in chat. Column widths are automatically padded for alignment.")]
+    #[tool(description = "Run a SELECT query and return results as a Markdown table, ready for display in chat. Column widths are automatically padded for alignment. Supports pagination via offset+max_rows: if the footer says more rows are available, call again with offset incremented by the number of rows returned.")]
     async fn export_query_markdown(&self, params: Parameters<ExportQueryMarkdownParams>) -> String {
-        let ExportQueryMarkdownParams { alias, sql, params: bind_params, max_rows } = params.0;
+        let ExportQueryMarkdownParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
+        let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
         let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
 
@@ -1875,12 +1916,17 @@ impl LumenSqlite {
 
         let mut data: Vec<Vec<String>> = Vec::new();
         let mut truncated = false;
+        let mut skipped = 0usize;
         let mut rows_iter = rows_iter;
         loop {
             match rows_iter.next() {
                 Err(e) => return format!("Row error: {e}"),
                 Ok(None) => break,
                 Ok(Some(row)) => {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
                     if max_rows > 0 && data.len() >= max_rows {
                         truncated = true;
                         break;
@@ -1897,7 +1943,11 @@ impl LumenSqlite {
         drop(stmt);
 
         if data.is_empty() {
-            return "(no rows)".to_string();
+            return if offset > 0 {
+                format!("(No rows at offset {offset} -- past end of results.)")
+            } else {
+                "(no rows)".to_string()
+            };
         }
 
         // Calculate column widths
@@ -1935,7 +1985,13 @@ impl LumenSqlite {
         }
 
         if truncated {
-            out.push_str(&format!("\n_(Truncated at {max_rows} rows.)_\n"));
+            let start = offset + 1;
+            let end = offset + data.len();
+            out.push_str(&format!("\n_(Rows {start}-{end}, more available. Call again with `offset={end}`.)_\n"));
+        } else if offset > 0 {
+            let start = offset + 1;
+            let end = offset + data.len();
+            out.push_str(&format!("\n_(Rows {start}-{end}, end of results.)_\n"));
         }
         out
     }
