@@ -137,6 +137,51 @@ impl LumenSqlite {
 
         Ok(resolved)
     }
+
+    /// Resolve a file path for CSV/TSV I/O (no extension restriction).
+    fn resolve_file_path(&self, path_str: &str) -> Result<PathBuf, String> {
+        let p = Path::new(path_str);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.db_dir.join(p)
+        };
+
+        // For files that already exist, canonicalize fully.
+        // For new output files, canonicalize the parent directory.
+        let resolved = if p.exists() {
+            p.canonicalize().map_err(|e| format!("Cannot resolve path: {e}"))?
+        } else {
+            let parent = p
+                .parent()
+                .ok_or_else(|| "Invalid path: no parent directory".to_string())?;
+            let parent = if parent.as_os_str().is_empty() {
+                self.db_dir.clone()
+            } else if parent.exists() {
+                parent
+                    .canonicalize()
+                    .map_err(|e| format!("Cannot resolve parent: {e}"))?
+            } else {
+                return Err(format!(
+                    "Parent directory '{}' does not exist",
+                    parent.display()
+                ));
+            };
+            parent.join(p.file_name().unwrap())
+        };
+
+        // Sandbox check
+        if self.sandbox && !resolved.starts_with(&self.db_dir) {
+            return Err(format!(
+                "Path '{}' is outside the allowed directory '{}'. \
+                 Sandbox mode is enabled (LUMEN_SQLITE_SANDBOX=1).",
+                resolved.display(),
+                self.db_dir.display()
+            ));
+        }
+
+        Ok(resolved)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +242,47 @@ fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
 /// Escape a SQL identifier for use inside double-quotes.
 fn escape_identifier(name: &str) -> String {
     name.replace('"', "\"\"")
+}
+
+/// Return the CSV delimiter byte to use for a file.
+/// If `delimiter` is explicitly given, parse it (accepts single ASCII char or `\t`).
+/// Otherwise, auto-detect from the file extension: `.tsv` → tab, everything else → comma.
+fn parse_delimiter(delimiter: &Option<String>, path: &Path) -> Result<u8, String> {
+    if let Some(d) = delimiter {
+        // Accept the two-character escape sequence "\t" as a tab
+        if d == r"\t" || d == "\t" {
+            return Ok(b'\t');
+        }
+        let bytes = d.as_bytes();
+        if bytes.len() == 1 {
+            return Ok(bytes[0]);
+        }
+        return Err(format!(
+            "delimiter must be a single character (or \\t for tab), got: {d:?}"
+        ));
+    }
+    // Auto-detect from extension
+    if path.extension().and_then(|e| e.to_str()) == Some("tsv") {
+        Ok(b'\t')
+    } else {
+        Ok(b',')
+    }
+}
+
+/// Guess the best SQLite column type by sampling a slice of string values.
+/// Returns "INTEGER", "REAL", or "TEXT".
+fn infer_sqlite_type(vals: &[&str]) -> &'static str {
+    let non_empty: Vec<&&str> = vals.iter().filter(|v| !v.is_empty()).collect();
+    if non_empty.is_empty() {
+        return "TEXT";
+    }
+    if non_empty.iter().all(|v| v.parse::<i64>().is_ok()) {
+        return "INTEGER";
+    }
+    if non_empty.iter().all(|v| v.parse::<f64>().is_ok()) {
+        return "REAL";
+    }
+    "TEXT"
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +414,52 @@ pub struct RenameTableParams {
     pub old_name: String,
     /// New table name.
     pub new_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct InspectCsvFileParams {
+    /// Path to the CSV or TSV file to inspect. Absolute or relative to LUMEN_SQLITE_DB_DIR.
+    pub path: String,
+    /// Column delimiter. "," for CSV (default), "\t" for TSV. Single character.
+    pub delimiter: Option<String>,
+    /// Number of data rows to sample for type inference (default: 5).
+    pub sample_rows: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ImportCsvFileParams {
+    /// The alias of the open database to import into.
+    pub alias: String,
+    /// Path to the CSV or TSV file. Absolute or relative to LUMEN_SQLITE_DB_DIR.
+    pub path: String,
+    /// Target table name. Required when has_headers is false; defaults to the file stem otherwise.
+    pub table: Option<String>,
+    /// Whether the first row is a header row with column names (default: true).
+    pub has_headers: Option<bool>,
+    /// Column names to use when has_headers is false. Must match the number of columns in the file.
+    pub columns: Option<Vec<String>>,
+    /// Column delimiter. "," for CSV (default), "\t" for TSV. Single character.
+    pub delimiter: Option<String>,
+    /// What to do if the table already exists: "append" (default) or "replace".
+    pub if_exists: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ExportQueryCsvFileParams {
+    /// The alias of the open database.
+    pub alias: String,
+    /// A SELECT statement to export.
+    pub sql: String,
+    /// Optional bind parameters for the query.
+    pub params: Option<Vec<serde_json::Value>>,
+    /// Path to write the output file. Absolute or relative to LUMEN_SQLITE_DB_DIR.
+    pub path: String,
+    /// Whether to emit a header row with column names (default: true).
+    pub emit_headers: Option<bool>,
+    /// Column delimiter. "," for CSV (default), "\t" for TSV. Single character.
+    pub delimiter: Option<String>,
+    /// Maximum rows to export (default: 10000). Set 0 for unlimited.
+    pub max_rows: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1184,271 @@ impl LumenSqlite {
                     csv_text.push_str(&format!("\n# ... truncated at {max_rows} rows\n"));
                 }
                 csv_text
+            }
+        }
+    }
+
+    #[tool(description = "Inspect a CSV or TSV file on disk: detect the delimiter, identify column names from the header row, sample data rows, and infer likely SQLite column types. Use this before import_csv_file to understand an unfamiliar file's structure.")]
+    async fn inspect_csv_file(&self, params: Parameters<InspectCsvFileParams>) -> String {
+        let InspectCsvFileParams { path, delimiter, sample_rows } = params.0;
+        let sample_rows = sample_rows.unwrap_or(5);
+
+        let file_path = match self.resolve_file_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let raw = match std::fs::read(&file_path) {
+            Ok(b) => b,
+            Err(e) => return format!("Cannot read file '{}': {e}", file_path.display()),
+        };
+
+        let delim_byte = match parse_delimiter(&delimiter, &file_path) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+
+        let mut rdr = csv_crate::ReaderBuilder::new()
+            .delimiter(delim_byte)
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(std::io::Cursor::new(&raw));
+
+        let headers: Vec<String> = match rdr.headers() {
+            Ok(h) => h.iter().map(|s| s.trim().to_string()).collect(),
+            Err(e) => return format!("CSV parse error: {e}"),
+        };
+
+        let mut samples: Vec<Vec<String>> = Vec::new();
+        for result in rdr.records().take(sample_rows) {
+            match result {
+                Ok(r) => samples.push(r.iter().map(|s| s.to_string()).collect()),
+                Err(_) => break,
+            }
+        }
+
+        let delim_name = if delim_byte == b'\t' { "TSV (tab-separated)" } else { "CSV (comma-separated)" };
+        let mut out = format!(
+            "File: {}\nFormat: {}\nColumns: {}\nSample rows shown: {}\n\nColumn schema (inferred):\n",
+            file_path.display(), delim_name, headers.len(), samples.len(),
+        );
+        for (i, col) in headers.iter().enumerate() {
+            let col_vals: Vec<&str> = samples.iter()
+                .filter_map(|r| r.get(i).map(|s| s.as_str()))
+                .collect();
+            let inferred = infer_sqlite_type(&col_vals);
+            out.push_str(&format!("  {col}  →  {inferred}\n"));
+        }
+        if !samples.is_empty() {
+            out.push_str(&format!("\nSample data ({} row(s)):\n", samples.len()));
+            out.push_str(&headers.join("\t"));
+            out.push('\n');
+            for row in &samples {
+                out.push_str(&row.join("\t"));
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[tool(description = "Import a CSV or TSV file from disk into a database table. Supports files with or without header rows. When has_headers is false, supply column names via the 'columns' parameter. Prefer this over import_csv for large files.")]
+    async fn import_csv_file(&self, params: Parameters<ImportCsvFileParams>) -> String {
+        let ImportCsvFileParams { alias, path, table, has_headers, columns, delimiter, if_exists } = params.0;
+        let has_headers = has_headers.unwrap_or(true);
+        let if_exists = if_exists.unwrap_or_else(|| "append".to_string());
+
+        let file_path = match self.resolve_file_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let delim_byte = match parse_delimiter(&delimiter, &file_path) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+
+        let raw = match std::fs::read(&file_path) {
+            Ok(b) => b,
+            Err(e) => return format!("Cannot read file '{}': {e}", file_path.display()),
+        };
+
+        let mut rdr = csv_crate::ReaderBuilder::new()
+            .delimiter(delim_byte)
+            .has_headers(has_headers)
+            .flexible(true)
+            .from_reader(std::io::Cursor::new(&raw));
+
+        let col_names: Vec<String> = if has_headers {
+            match rdr.headers() {
+                Ok(h) => h.iter().map(|s| s.trim().to_string()).collect(),
+                Err(e) => return format!("CSV parse error: {e}"),
+            }
+        } else {
+            match columns {
+                Some(c) => c,
+                None => return "has_headers is false: you must supply 'columns' with the column names to use.".to_string(),
+            }
+        };
+
+        if col_names.is_empty() {
+            return "No columns found.".to_string();
+        }
+        for c in &col_names {
+            if let Err(e) = validate_identifier(c, "column name") {
+                return e;
+            }
+        }
+
+        let table_name = match table {
+            Some(t) => t,
+            None => file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported").to_string(),
+        };
+        if let Err(e) = validate_identifier(&table_name, "table name") {
+            return e;
+        }
+
+        let rows: Vec<Vec<String>> = rdr
+            .records()
+            .filter_map(|r| r.ok())
+            .filter(|r| !r.is_empty())
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect();
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let escaped_table = escape_identifier(&table_name);
+        let col_defs: String = col_names.iter()
+            .map(|c| format!("\"{}\" TEXT", escape_identifier(c)))
+            .collect::<Vec<_>>().join(", ");
+        let placeholders: String = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let insert_sql = format!("INSERT INTO \"{escaped_table}\" VALUES ({placeholders})");
+
+        let result: rusqlite::Result<()> = (|| {
+            if if_exists == "replace" {
+                db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+            }
+            db.conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"))?;
+            db.conn.execute_batch("BEGIN TRANSACTION")?;
+            let mut stmt = db.conn.prepare(&insert_sql)?;
+            for row in &rows {
+                let row_refs: Vec<&dyn rusqlite::ToSql> = row.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                stmt.execute(row_refs.as_slice())?;
+            }
+            drop(stmt);
+            db.conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                info!("Imported {} rows from '{}' into '{alias}.{table_name}'", rows.len(), file_path.display());
+                format!(
+                    "Imported {} rows into '{table_name}' from '{}' ({} columns: {}).",
+                    rows.len(), file_path.display(), col_names.len(), col_names.join(", ")
+                )
+            }
+            Err(e) => {
+                let _ = db.conn.execute_batch("ROLLBACK");
+                format!("Import error: {e}")
+            }
+        }
+    }
+
+    #[tool(description = "Run a SELECT query and write results to a CSV or TSV file on disk. Use for large exports that would be unwieldy as inline text. Supports optional header row and custom delimiter. Returns a row count summary.")]
+    async fn export_query_csv_file(&self, params: Parameters<ExportQueryCsvFileParams>) -> String {
+        let ExportQueryCsvFileParams { alias, sql, params: bind_params, path, emit_headers, delimiter, max_rows } = params.0;
+        let emit_headers = emit_headers.unwrap_or(true);
+        let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
+        let bind_params = bind_params.unwrap_or_default();
+        let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
+
+        let file_path = match self.resolve_file_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let delim_byte = match parse_delimiter(&delimiter, &file_path) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let mut stmt = match db.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => return format!("SQL error: {e}"),
+        };
+
+        if stmt.column_count() == 0 {
+            return "Statement did not return results.".to_string();
+        }
+
+        let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
+        let col_count = stmt.column_count();
+
+        let file = match std::fs::File::create(&file_path) {
+            Ok(f) => f,
+            Err(e) => return format!("Cannot create file '{}': {e}", file_path.display()),
+        };
+
+        let mut wtr = csv_crate::WriterBuilder::new()
+            .delimiter(delim_byte)
+            .from_writer(file);
+
+        if emit_headers {
+            if let Err(e) = wtr.write_record(&col_names) {
+                return format!("Write error: {e}");
+            }
+        }
+
+        let rows_result: rusqlite::Result<(usize, bool)> =
+            stmt.query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
+                let vals: Vec<String> = (0..col_count)
+                    .map(|i| row.get_ref(i).map(value_ref_to_string).unwrap_or_default())
+                    .collect();
+                Ok(vals)
+            })
+            .and_then(|mapped| {
+                let mut count = 0usize;
+                let mut truncated = false;
+                for row in mapped {
+                    let r = row?;
+                    if max_rows > 0 && count >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    wtr.write_record(&r)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    count += 1;
+                }
+                Ok((count, truncated))
+            });
+
+        if let Err(e) = wtr.flush() {
+            return format!("Write error: {e}");
+        }
+        drop(wtr);
+
+        match rows_result {
+            Err(e) => format!("SQL error: {e}"),
+            Ok((count, truncated)) => {
+                info!("Exported {count} rows to '{}'", file_path.display());
+                let mut msg = format!(
+                    "Exported {count} rows to '{}' ({} columns).",
+                    file_path.display(), col_names.len()
+                );
+                if truncated {
+                    msg.push_str(&format!(" Truncated at {max_rows} rows."));
+                }
+                msg
             }
         }
     }
