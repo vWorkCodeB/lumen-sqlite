@@ -873,6 +873,29 @@ impl LumenSqlite {
                     }
                 }
             }
+
+            // Indexes on this table
+            let indexes: Vec<(String, i32)> = {
+                let mut stmt = db.conn.prepare(&format!("PRAGMA index_list(\"{safe}\")")).ok();
+                stmt.as_mut().and_then(|s| {
+                    s.query_map([], |row| Ok((
+                        row.get::<_, String>(1)?,  // name
+                        row.get::<_, i32>(2)?,     // unique
+                    ))).ok().map(|m| m.flatten().collect())
+                }).unwrap_or_default()
+            };
+            for (idx_name, unique) in &indexes {
+                let safe_idx = escape_identifier(idx_name);
+                let cols: Vec<String> = {
+                    let mut stmt = db.conn.prepare(&format!("PRAGMA index_info(\"{safe_idx}\")")).ok();
+                    stmt.as_mut().and_then(|s| {
+                        s.query_map([], |row| row.get::<_, String>(2)).ok()
+                            .map(|m| m.flatten().collect())
+                    }).unwrap_or_default()
+                };
+                let unique_str = if *unique != 0 { "UNIQUE " } else { "" };
+                lines.push(format!("  {unique_str}INDEX {idx_name} ({})", cols.join(", ")));
+            }
         }
 
         lines.push(String::new());
@@ -2088,6 +2111,53 @@ impl LumenSqlite {
             lines.push(String::new());
             lines.push("DDL:".to_string());
             lines.push(ddl);
+        }
+
+        // Indexes
+        let safe = escape_identifier(&table);
+        let indexes: Vec<(String, i32, String)> = {
+            let mut stmt = db.conn.prepare(&format!("PRAGMA index_list(\"{safe}\")")).ok();
+            stmt.as_mut().and_then(|s| {
+                s.query_map([], |row| Ok((
+                    row.get::<_, String>(1)?,  // name
+                    row.get::<_, i32>(2)?,     // unique
+                    row.get::<_, String>(3)?,  // origin: c=CREATE INDEX, u=UNIQUE constraint, pk=PRIMARY KEY
+                ))).ok().map(|m| m.flatten().collect())
+            }).unwrap_or_default()
+        };
+
+        if !indexes.is_empty() {
+            lines.push(String::new());
+            lines.push("Indexes:".to_string());
+            for (idx_name, unique, origin) in &indexes {
+                let safe_idx = escape_identifier(idx_name);
+                let cols: Vec<String> = {
+                    let mut stmt = db.conn.prepare(&format!("PRAGMA index_info(\"{safe_idx}\")")).ok();
+                    stmt.as_mut().and_then(|s| {
+                        s.query_map([], |row| row.get::<_, String>(2)).ok()
+                            .map(|m| m.flatten().collect())
+                    }).unwrap_or_default()
+                };
+                let kind = match origin.as_str() {
+                    "pk" => "PRIMARY KEY",
+                    "u"  => "UNIQUE constraint",
+                    _    => if *unique != 0 { "UNIQUE INDEX" } else { "INDEX" },
+                };
+                // Get DDL for explicit CREATE INDEX (origin == "c")
+                let idx_ddl: Option<String> = if origin == "c" {
+                    db.conn.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                        rusqlite::params![idx_name],
+                        |row| row.get(0),
+                    ).ok().flatten()
+                } else {
+                    None
+                };
+                lines.push(format!("  {idx_name}  [{kind}]  columns: ({})", cols.join(", ")));
+                if let Some(ddl) = idx_ddl {
+                    lines.push(format!("    {ddl}"));
+                }
+            }
         }
 
         lines.join("\n")

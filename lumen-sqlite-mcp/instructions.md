@@ -118,6 +118,18 @@ the number of rows returned each time, until you see "end of results".
   (row count, columns) so you can confirm before proceeding.
 - **rename_table** — Rename a table via ALTER TABLE ... RENAME TO.
 
+## Index visibility
+
+Indexes are now shown automatically in two places:
+
+- **database_info** — Lists all indexes inline under each table in the summary
+  view: `INDEX idx_name (col1, col2)` or `UNIQUE INDEX idx_name (col)`.
+- **describe_table** — Shows full index detail: index name, kind (INDEX,
+  UNIQUE INDEX, UNIQUE constraint, PRIMARY KEY), column list, and the original
+  `CREATE INDEX` DDL when available.
+
+Use **explain_query** to verify that a query actually uses an index.
+
 ## Query debugging
 
 - **explain_query** — Wraps EXPLAIN QUERY PLAN. Shows how SQLite will execute
