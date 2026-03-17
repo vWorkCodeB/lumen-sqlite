@@ -285,6 +285,99 @@ fn infer_sqlite_type(vals: &[&str]) -> &'static str {
     "TEXT"
 }
 
+/// Map a serde_json::Value to the SQLite column type name it represents.
+fn json_value_to_sqlite_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            if let Some(n) = v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)) {
+                let _ = n;
+                "INTEGER"
+            } else {
+                "REAL"
+            }
+        }
+        _ => "TEXT",
+    }
+}
+
+/// Shared implementation for import_json and import_json_file.
+fn import_json_objects(
+    connections: &Mutex<HashMap<String, OpenDatabase>>,
+    alias: &str,
+    table: &str,
+    if_exists: &str,
+    col_names: &[String],
+    arr: &[serde_json::Map<String, serde_json::Value>],
+) -> String {
+    // Infer types from first non-null value per column
+    let col_types: Vec<&'static str> = col_names.iter().map(|col| {
+        for obj in arr.iter().take(200) {
+            if let Some(v) = obj.get(col) {
+                if !v.is_null() {
+                    return json_value_to_sqlite_type(v);
+                }
+            }
+        }
+        "TEXT"
+    }).collect();
+
+    let conns = connections.lock().unwrap();
+    let db = match conns.get(alias) {
+        Some(d) => d,
+        None => return LumenSqlite::no_such_alias(alias, &conns),
+    };
+
+    let escaped_table = escape_identifier(table);
+    let col_defs: String = col_names.iter().zip(col_types.iter())
+        .map(|(c, t)| format!("\"{}\" {t}", escape_identifier(c)))
+        .collect::<Vec<_>>().join(", ");
+    let placeholders: String = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let insert_sql = format!("INSERT INTO \"{escaped_table}\" VALUES ({placeholders})");
+
+    let result: rusqlite::Result<()> = (|| {
+        if if_exists == "replace" {
+            db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+        } else if if_exists == "error" {
+            let exists: bool = db.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if exists {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!("Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                ));
+            }
+        }
+        db.conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"))?;
+        db.conn.execute_batch("BEGIN TRANSACTION")?;
+        let mut stmt = db.conn.prepare(&insert_sql)?;
+        for obj in arr {
+            let vals: Vec<serde_json::Value> = col_names.iter()
+                .map(|c| obj.get(c).cloned().unwrap_or(serde_json::Value::Null))
+                .collect();
+            let row_refs: Vec<JsonParam> = vals.into_iter().map(JsonParam).collect();
+            let row_sql_refs: Vec<&dyn rusqlite::ToSql> = row_refs.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            stmt.execute(row_sql_refs.as_slice())?;
+        }
+        drop(stmt);
+        db.conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => format!(
+            "Imported {} rows into '{table}' ({} columns: {}).",
+            arr.len(), col_names.len(), col_names.join(", ")
+        ),
+        Err(e) => {
+            let _ = db.conn.execute_batch("ROLLBACK");
+            format!("Import error: {e}")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool parameter types
 // ---------------------------------------------------------------------------
@@ -459,6 +552,60 @@ pub struct ExportQueryCsvFileParams {
     /// Column delimiter. "," for CSV (default), "\t" for TSV. Single character.
     pub delimiter: Option<String>,
     /// Maximum rows to export (default: 10000). Set 0 for unlimited.
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ImportJsonParams {
+    /// The alias of the open database.
+    pub alias: String,
+    /// A JSON array of objects to import. All objects should share the same keys.
+    pub json_text: String,
+    /// Target table name (default: "imported").
+    pub table: Option<String>,
+    /// What to do if the table already exists: "error" (default), "replace", "append".
+    pub if_exists: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ImportJsonFileParams {
+    /// The alias of the open database.
+    pub alias: String,
+    /// Path to the JSON file. Absolute or relative to LUMEN_SQLITE_DB_DIR.
+    pub path: String,
+    /// Target table name (default: file stem).
+    pub table: Option<String>,
+    /// File format: "array" (default, a JSON array of objects) or "ndjson" (one JSON object per line).
+    pub format: Option<String>,
+    /// What to do if the table already exists: "error" (default), "replace", "append".
+    pub if_exists: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ExportQueryJsonFileParams {
+    /// The alias of the open database.
+    pub alias: String,
+    /// A SELECT statement to export.
+    pub sql: String,
+    /// Optional bind parameters for the query.
+    pub params: Option<Vec<serde_json::Value>>,
+    /// Path to write the output file. Absolute or relative to LUMEN_SQLITE_DB_DIR.
+    pub path: String,
+    /// Output format: "array" (default, a JSON array of objects) or "ndjson" (one JSON object per line).
+    pub format: Option<String>,
+    /// Maximum rows to export (default: 10000). Set 0 for unlimited.
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ExportQueryMarkdownParams {
+    /// The alias of the open database.
+    pub alias: String,
+    /// A SELECT statement to render.
+    pub sql: String,
+    /// Optional bind parameters for the query.
+    pub params: Option<Vec<serde_json::Value>>,
+    /// Maximum rows to return (default: from env or 500).
     pub max_rows: Option<usize>,
 }
 
@@ -1490,6 +1637,307 @@ impl LumenSqlite {
                 msg
             }
         }
+    }
+
+    #[tool(description = "Import a JSON array of objects (inline text) into a table. Column types are inferred from the JSON value types. All rows inserted in a single transaction.")]
+    async fn import_json(&self, params: Parameters<ImportJsonParams>) -> String {
+        let ImportJsonParams { alias, json_text, table, if_exists } = params.0;
+        let table = table.unwrap_or_else(|| "imported".to_string());
+        let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
+
+        if let Err(e) = validate_identifier(&table, "table name") {
+            return e;
+        }
+
+        let arr: Vec<serde_json::Map<String, serde_json::Value>> =
+            match serde_json::from_str::<serde_json::Value>(&json_text) {
+                Ok(serde_json::Value::Array(arr)) => arr
+                    .into_iter()
+                    .filter_map(|v| if let serde_json::Value::Object(m) = v { Some(m) } else { None })
+                    .collect(),
+                Ok(_) => return "JSON must be an array of objects.".to_string(),
+                Err(e) => return format!("JSON parse error: {e}"),
+            };
+
+        if arr.is_empty() {
+            return "JSON array is empty.".to_string();
+        }
+
+        // Collect column names from the first object
+        let col_names: Vec<String> = arr[0].keys().cloned().collect();
+        for c in &col_names {
+            if let Err(e) = validate_identifier(c, "column name") {
+                return e;
+            }
+        }
+
+        import_json_objects(&self.connections, &alias, &table, &if_exists, &col_names, &arr)
+    }
+
+    #[tool(description = "Import a JSON file (array of objects or NDJSON) into a table. Column types are inferred from JSON value types. All rows inserted in a single transaction.")]
+    async fn import_json_file(&self, params: Parameters<ImportJsonFileParams>) -> String {
+        let ImportJsonFileParams { alias, path, table, format, if_exists } = params.0;
+        let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
+        let format = format.unwrap_or_else(|| "array".to_string());
+
+        let file_path = match self.resolve_file_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let table = match table {
+            Some(t) => t,
+            None => file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported").to_string(),
+        };
+        if let Err(e) = validate_identifier(&table, "table name") {
+            return e;
+        }
+
+        let raw = match std::fs::read_to_string(&file_path) {
+            Ok(s) => s,
+            Err(e) => return format!("Cannot read file '{}': {e}", file_path.display()),
+        };
+
+        let arr: Vec<serde_json::Map<String, serde_json::Value>> = if format == "ndjson" {
+            let mut objs = Vec::new();
+            for (i, line) in raw.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(serde_json::Value::Object(m)) => objs.push(m),
+                    Ok(_) => return format!("Line {}: expected a JSON object.", i + 1),
+                    Err(e) => return format!("Line {}: JSON parse error: {e}", i + 1),
+                }
+            }
+            objs
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Array(arr)) => arr
+                    .into_iter()
+                    .filter_map(|v| if let serde_json::Value::Object(m) = v { Some(m) } else { None })
+                    .collect(),
+                Ok(_) => return "JSON file must contain an array of objects (or use format='ndjson').".to_string(),
+                Err(e) => return format!("JSON parse error: {e}"),
+            }
+        };
+
+        if arr.is_empty() {
+            return "JSON source is empty.".to_string();
+        }
+
+        let col_names: Vec<String> = arr[0].keys().cloned().collect();
+        for c in &col_names {
+            if let Err(e) = validate_identifier(c, "column name") {
+                return e;
+            }
+        }
+
+        let result = import_json_objects(&self.connections, &alias, &table, &if_exists, &col_names, &arr);
+        info!("Imported from JSON file '{}'", file_path.display());
+        result
+    }
+
+    #[tool(description = "Run a SELECT query and write results to a JSON file: either a JSON array of objects (format='array', default) or NDJSON with one object per line (format='ndjson', streaming-friendly for large files).")]
+    async fn export_query_json_file(&self, params: Parameters<ExportQueryJsonFileParams>) -> String {
+        let ExportQueryJsonFileParams { alias, sql, params: bind_params, path, format, max_rows } = params.0;
+        let format = format.unwrap_or_else(|| "array".to_string());
+        let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
+        let bind_params = bind_params.unwrap_or_default();
+        let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
+
+        let file_path = match self.resolve_file_path(&path) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let mut stmt = match db.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => return format!("SQL error: {e}"),
+        };
+        if stmt.column_count() == 0 {
+            return "Statement did not return results.".to_string();
+        }
+
+        let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
+        let col_count = stmt.column_count();
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let rows_iter = match stmt.query(param_refs.as_slice()) {
+            Ok(r) => r,
+            Err(e) => return format!("Query error: {e}"),
+        };
+
+        // Collect rows as JSON objects
+        let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut truncated = false;
+        let mut rows_iter = rows_iter;
+        loop {
+            match rows_iter.next() {
+                Err(e) => return format!("Row error: {e}"),
+                Ok(None) => break,
+                Ok(Some(row)) => {
+                    if max_rows > 0 && rows.len() >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    let mut obj = serde_json::Map::new();
+                    for i in 0..col_count {
+                        let val = match row.get_ref(i) {
+                            Ok(ValueRef::Null) => serde_json::Value::Null,
+                            Ok(ValueRef::Integer(n)) => serde_json::Value::Number(n.into()),
+                            Ok(ValueRef::Real(f)) => {
+                                serde_json::Number::from_f64(f)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
+                            }
+                            Ok(ValueRef::Text(t)) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+                            Ok(ValueRef::Blob(b)) => serde_json::Value::String(format!("<blob {} bytes>", b.len())),
+                            Err(_) => serde_json::Value::Null,
+                        };
+                        obj.insert(col_names[i].clone(), val);
+                    }
+                    rows.push(obj);
+                }
+            }
+        }
+        drop(rows_iter);
+        drop(stmt);
+
+        // Write to file
+        let write_result: std::io::Result<()> = (|| {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&file_path)?;
+            if format == "ndjson" {
+                for obj in &rows {
+                    let line = serde_json::to_string(obj).unwrap();
+                    f.write_all(line.as_bytes())?;
+                    f.write_all(b"\n")?;
+                }
+            } else {
+                let json = serde_json::to_string_pretty(&rows).unwrap();
+                f.write_all(json.as_bytes())?;
+                f.write_all(b"\n")?;
+            }
+            Ok(())
+        })();
+
+        match write_result {
+            Err(e) => format!("Write error: {e}"),
+            Ok(()) => {
+                info!("Exported {} rows to '{}' as JSON {format}", rows.len(), file_path.display());
+                let mut msg = format!(
+                    "Exported {} rows to '{}' ({format}, {} columns).",
+                    rows.len(), file_path.display(), col_names.len()
+                );
+                if truncated {
+                    msg.push_str(&format!(" Truncated at {max_rows} rows."));
+                }
+                msg
+            }
+        }
+    }
+
+    #[tool(description = "Run a SELECT query and return results as a Markdown table, ready for display in chat. Column widths are automatically padded for alignment.")]
+    async fn export_query_markdown(&self, params: Parameters<ExportQueryMarkdownParams>) -> String {
+        let ExportQueryMarkdownParams { alias, sql, params: bind_params, max_rows } = params.0;
+        let max_rows = max_rows.unwrap_or(self.default_max_rows);
+        let bind_params = bind_params.unwrap_or_default();
+        let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
+
+        let conns = self.connections.lock().unwrap();
+        let db = match conns.get(&alias) {
+            Some(d) => d,
+            None => return Self::no_such_alias(&alias, &conns),
+        };
+
+        let mut stmt = match db.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => return format!("SQL error: {e}"),
+        };
+        if stmt.column_count() == 0 {
+            return "Statement did not return results.".to_string();
+        }
+
+        let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
+        let col_count = stmt.column_count();
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let rows_iter = match stmt.query(param_refs.as_slice()) {
+            Ok(r) => r,
+            Err(e) => return format!("Query error: {e}"),
+        };
+
+        let mut data: Vec<Vec<String>> = Vec::new();
+        let mut truncated = false;
+        let mut rows_iter = rows_iter;
+        loop {
+            match rows_iter.next() {
+                Err(e) => return format!("Row error: {e}"),
+                Ok(None) => break,
+                Ok(Some(row)) => {
+                    if max_rows > 0 && data.len() >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    let cells: Vec<String> = (0..col_count)
+                        .map(|i| value_ref_to_string(row.get_ref(i).unwrap_or(ValueRef::Null)))
+                        .map(|s| s.replace('|', "\\|").replace('\n', " "))
+                        .collect();
+                    data.push(cells);
+                }
+            }
+        }
+        drop(rows_iter);
+        drop(stmt);
+
+        if data.is_empty() {
+            return "(no rows)".to_string();
+        }
+
+        // Calculate column widths
+        let mut widths: Vec<usize> = col_names.iter().map(|h| h.len()).collect();
+        for row in &data {
+            for (i, cell) in row.iter().enumerate() {
+                if i < widths.len() {
+                    widths[i] = widths[i].max(cell.len());
+                }
+            }
+        }
+
+        // Render
+        let mut out = String::new();
+        // Header
+        out.push('|');
+        for (i, h) in col_names.iter().enumerate() {
+            out.push_str(&format!(" {:width$} |", h, width = widths[i]));
+        }
+        out.push('\n');
+        // Separator
+        out.push('|');
+        for w in &widths {
+            out.push_str(&format!(" {} |", "-".repeat(*w)));
+        }
+        out.push('\n');
+        // Rows
+        for row in &data {
+            out.push('|');
+            for (i, cell) in row.iter().enumerate() {
+                let w = widths.get(i).copied().unwrap_or(0);
+                out.push_str(&format!(" {:width$} |", cell, width = w));
+            }
+            out.push('\n');
+        }
+
+        if truncated {
+            out.push_str(&format!("\n_(Truncated at {max_rows} rows.)_\n"));
+        }
+        out
     }
 
     #[tool(description = "List all tables in the database.")]

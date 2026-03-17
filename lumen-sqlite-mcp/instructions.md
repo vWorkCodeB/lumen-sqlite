@@ -258,6 +258,50 @@ Both reading and writing use the file extension when no explicit delimiter is gi
 
 To force tab-delimited output for a `.csv` file, pass `"delimiter": "\t"`.
 
+## JSON import/export tools
+
+### import_json
+
+Import an inline JSON array of objects into a table. Column types are inferred
+directly from the JSON value types (number → INTEGER or REAL, everything else
+→ TEXT). Missing keys in any row are stored as NULL.
+
+Parameters:
+- `alias`, `table`, `if_exists` — same semantics as `import_csv_file`
+- `json_text` — a JSON array of objects as a string
+
+### import_json_file
+
+Read a JSON file and insert all records into a table. Supports two formats:
+
+- `"array"` (default) — a single JSON array of objects
+- `"ndjson"` — newline-delimited JSON, one object per line (good for large files)
+
+Parameters same as `import_csv_file` plus `format`.
+
+### export_query_json_file
+
+Run a SELECT query and write the results to a JSON file.
+
+Parameters:
+- `alias`, `sql`, `params`, `path`, `max_rows` — same as other export tools
+- `format` — `"array"` (default, pretty-printed array of objects) or
+  `"ndjson"` (one object per line, compact, suitable for streaming)
+
+## Markdown table output
+
+### export_query_markdown
+
+Run a SELECT query and return the results as a formatted Markdown table,
+ready for display in chat. Column widths are padded for alignment. Pipe
+characters (`|`) in cell values are automatically escaped.
+
+Parameters:
+- `alias`, `sql`, `params`, `max_rows` — same as `execute_sql`
+
+Use this instead of `execute_sql` when you want results that render nicely
+in the conversation rather than as raw tab-separated text.
+
 ## Sandbox mode
 
 When the LUMEN_SQLITE_SANDBOX environment variable is set to 1 (or true/yes),
