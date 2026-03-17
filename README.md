@@ -69,7 +69,10 @@ cargo install lumen-sqlite-mcp
 ```
 
 This produces a single static binary (`lumen-sqlite-mcp` / `lumen-sqlite-mcp.exe`)
-with SQLite compiled in. No other runtime or dependencies are required.
+with SQLite compiled in. No other runtime or dependencies are required. By default,
+`cargo install` places the compiled binary in `~/.cargo/bin` (Linux, macOS) or
+`%USERPROFILE%\.cargo\bin` (Windows). Ordinarily, the `.cargo/bin` directory is
+in your shell's `PATH` variable.
 
 ## Client Configuration
 
@@ -90,6 +93,9 @@ Add to your `.vscode/mcp.json`:
   }
 }
 ```
+
+If your `PATH` does not include `~/.cargo/bin` then you will need to change the `"command"`
+so that it points to the exact path of the `lumen-sqlite-mcp` binary.
 
 ### Claude Desktop
 
