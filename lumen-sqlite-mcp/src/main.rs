@@ -1020,11 +1020,11 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Import CSV text into a table. If the table does not exist, it is created automatically from the header row (all columns TEXT). All rows inserted in a single transaction.")]
+    #[tool(description = "Import CSV text into a table. If the table does not exist, it is created automatically from the header row with inferred column types. All rows inserted in a single transaction.")]
     async fn import_csv(&self, params: Parameters<ImportCsvParams>) -> String {
         let ImportCsvParams { alias, csv_text, table, if_exists } = params.0;
         let table = table.unwrap_or_else(|| "imported".to_string());
-        let if_exists = if_exists.unwrap_or_else(|| "append".to_string());
+        let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
 
         if let Err(e) = validate_identifier(&table, "table name") {
             return e;
@@ -1063,9 +1063,16 @@ impl LumenSqlite {
         };
 
         let escaped_table = escape_identifier(&table);
+        let col_types: Vec<&'static str> = (0..headers.len()).map(|ci| {
+            let samples: Vec<&str> = rows.iter()
+                .take(200)
+                .filter_map(|r| r.get(ci).map(|s| s.as_str()))
+                .collect();
+            infer_sqlite_type(&samples)
+        }).collect();
         let col_defs: String = headers
-            .iter()
-            .map(|h| format!("\"{}\" TEXT", escape_identifier(h)))
+            .iter().zip(col_types.iter())
+            .map(|(h, t)| format!("\"{}\" {t}", escape_identifier(h)))
             .collect::<Vec<_>>()
             .join(", ");
         let placeholders: String = (0..headers.len())
@@ -1077,6 +1084,18 @@ impl LumenSqlite {
         let result: rusqlite::Result<()> = (|| {
             if if_exists == "replace" {
                 db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+            } else if if_exists == "error" {
+                let exists: bool = db.conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [&table],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if exists {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(format!("Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                    ));
+                }
             }
             db.conn.execute_batch(&format!(
                 "CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"
@@ -1255,7 +1274,7 @@ impl LumenSqlite {
     async fn import_csv_file(&self, params: Parameters<ImportCsvFileParams>) -> String {
         let ImportCsvFileParams { alias, path, table, has_headers, columns, delimiter, if_exists } = params.0;
         let has_headers = has_headers.unwrap_or(true);
-        let if_exists = if_exists.unwrap_or_else(|| "append".to_string());
+        let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
 
         let file_path = match self.resolve_file_path(&path) {
             Ok(p) => p,
@@ -1321,8 +1340,16 @@ impl LumenSqlite {
         };
 
         let escaped_table = escape_identifier(&table_name);
-        let col_defs: String = col_names.iter()
-            .map(|c| format!("\"{}\" TEXT", escape_identifier(c)))
+        // Infer per-column types from sampled row data
+        let col_types: Vec<&'static str> = (0..col_names.len()).map(|ci| {
+            let samples: Vec<&str> = rows.iter()
+                .take(200)
+                .filter_map(|r| r.get(ci).map(|s| s.as_str()))
+                .collect();
+            infer_sqlite_type(&samples)
+        }).collect();
+        let col_defs: String = col_names.iter().zip(col_types.iter())
+            .map(|(c, t)| format!("\"{}\" {t}", escape_identifier(c)))
             .collect::<Vec<_>>().join(", ");
         let placeholders: String = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
         let insert_sql = format!("INSERT INTO \"{escaped_table}\" VALUES ({placeholders})");
@@ -1330,6 +1357,18 @@ impl LumenSqlite {
         let result: rusqlite::Result<()> = (|| {
             if if_exists == "replace" {
                 db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+            } else if if_exists == "error" {
+                let exists: bool = db.conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [&table_name],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if exists {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(format!("Table '{table_name}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                    ));
+                }
             }
             db.conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"))?;
             db.conn.execute_batch("BEGIN TRANSACTION")?;
