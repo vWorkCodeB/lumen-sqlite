@@ -91,7 +91,8 @@ impl LumenSqlite {
 
         // Canonicalize if the file already exists; otherwise canonicalize the parent.
         let resolved = if p.exists() {
-            p.canonicalize().map_err(|e| format!("Cannot resolve path: {e}"))?
+            p.canonicalize()
+                .map_err(|e| format!("Cannot resolve path: {e}"))?
         } else {
             let parent = p
                 .parent()
@@ -110,10 +111,7 @@ impl LumenSqlite {
         };
 
         // Check extension
-        let ext = resolved
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !ALLOWED_EXTENSIONS.contains(&ext) {
             return Err(format!(
                 "File extension '.{ext}' is not allowed. Use one of: {}",
@@ -150,7 +148,8 @@ impl LumenSqlite {
         // For files that already exist, canonicalize fully.
         // For new output files, canonicalize the parent directory.
         let resolved = if p.exists() {
-            p.canonicalize().map_err(|e| format!("Cannot resolve path: {e}"))?
+            p.canonicalize()
+                .map_err(|e| format!("Cannot resolve path: {e}"))?
         } else {
             let parent = p
                 .parent()
@@ -310,16 +309,19 @@ fn import_json_objects(
     arr: &[serde_json::Map<String, serde_json::Value>],
 ) -> String {
     // Infer types from first non-null value per column
-    let col_types: Vec<&'static str> = col_names.iter().map(|col| {
-        for obj in arr.iter().take(200) {
-            if let Some(v) = obj.get(col) {
-                if !v.is_null() {
-                    return json_value_to_sqlite_type(v);
+    let col_types: Vec<&'static str> = col_names
+        .iter()
+        .map(|col| {
+            for obj in arr.iter().take(200) {
+                if let Some(v) = obj.get(col) {
+                    if !v.is_null() {
+                        return json_value_to_sqlite_type(v);
+                    }
                 }
             }
-        }
-        "TEXT"
-    }).collect();
+            "TEXT"
+        })
+        .collect();
 
     let conns = connections.lock().unwrap();
     let db = match conns.get(alias) {
@@ -328,15 +330,22 @@ fn import_json_objects(
     };
 
     let escaped_table = escape_identifier(table);
-    let col_defs: String = col_names.iter().zip(col_types.iter())
+    let col_defs: String = col_names
+        .iter()
+        .zip(col_types.iter())
         .map(|(c, t)| format!("\"{}\" {t}", escape_identifier(c)))
-        .collect::<Vec<_>>().join(", ");
-    let placeholders: String = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders: String = (0..col_names.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     let insert_sql = format!("INSERT INTO \"{escaped_table}\" VALUES ({placeholders})");
 
     let result: rusqlite::Result<()> = (|| {
         if if_exists == "replace" {
-            db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+            db.conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
         } else if if_exists == "error" {
             let exists: bool = db.conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -346,19 +355,25 @@ fn import_json_objects(
             if exists {
                 return Err(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                    Some(format!("Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                    Some(format!(
+                        "Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows."
+                    )),
                 ));
             }
         }
-        db.conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"))?;
+        db.conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"
+        ))?;
         db.conn.execute_batch("BEGIN TRANSACTION")?;
         let mut stmt = db.conn.prepare(&insert_sql)?;
         for obj in arr {
-            let vals: Vec<serde_json::Value> = col_names.iter()
+            let vals: Vec<serde_json::Value> = col_names
+                .iter()
                 .map(|c| obj.get(c).cloned().unwrap_or(serde_json::Value::Null))
                 .collect();
             let row_refs: Vec<JsonParam> = vals.into_iter().map(JsonParam).collect();
-            let row_sql_refs: Vec<&dyn rusqlite::ToSql> = row_refs.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let row_sql_refs: Vec<&dyn rusqlite::ToSql> =
+                row_refs.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
             stmt.execute(row_sql_refs.as_slice())?;
         }
         drop(stmt);
@@ -369,7 +384,9 @@ fn import_json_objects(
     match result {
         Ok(()) => format!(
             "Imported {} rows into '{table}' ({} columns: {}).",
-            arr.len(), col_names.len(), col_names.join(", ")
+            arr.len(),
+            col_names.len(),
+            col_names.join(", ")
         ),
         Err(e) => {
             let _ = db.conn.execute_batch("ROLLBACK");
@@ -697,7 +714,9 @@ pub struct AddColumnParams {
 
 #[tool_router]
 impl LumenSqlite {
-    #[tool(description = "Open or create a SQLite database file and assign it an alias (defaults to the file stem). Creates the file if it does not exist.")]
+    #[tool(
+        description = "Open or create a SQLite database file and assign it an alias (defaults to the file stem). Creates the file if it does not exist."
+    )]
     async fn open_database(&self, params: Parameters<OpenDatabaseParams>) -> String {
         let params = params.0;
         let db_path = match self.resolve_db_path(&params.path) {
@@ -744,17 +763,19 @@ impl LumenSqlite {
                 match (pattern, text) {
                     (Some(pat), Some(txt)) => {
                         let re = Regex::new(&pat).map_err(|e| {
-                            rusqlite::Error::UserFunctionError(Box::new(
-                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-                            ))
+                            rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                e.to_string(),
+                            )))
                         })?;
                         Ok(re.is_match(&txt) as i64)
                     }
                     _ => Ok(0i64),
                 }
             },
-        ).map_err(|e| format!("Failed to register regexp UDF: {e}"))
-         .unwrap_or(());
+        )
+        .map_err(|e| format!("Failed to register regexp UDF: {e}"))
+        .unwrap_or(());
 
         let verb = if creating {
             "Created and opened"
@@ -762,7 +783,13 @@ impl LumenSqlite {
             "Opened"
         };
         info!("{verb} database '{alias}' at {}", db_path.display());
-        conns.insert(alias.clone(), OpenDatabase { conn, path: db_path.clone() });
+        conns.insert(
+            alias.clone(),
+            OpenDatabase {
+                conn,
+                path: db_path.clone(),
+            },
+        );
         format!("{verb} database '{alias}' at {}", db_path.display())
     }
 
@@ -790,7 +817,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "List .db files in the data directory, including ones not currently open. Useful for discovering databases from prior sessions.")]
+    #[tool(
+        description = "List .db files in the data directory, including ones not currently open. Useful for discovering databases from prior sessions."
+    )]
     async fn list_database_files(&self) -> String {
         let mut files: Vec<PathBuf> = Vec::new();
         for ext in ALLOWED_EXTENSIONS {
@@ -826,10 +855,7 @@ impl LumenSqlite {
                     .modified()
                     .ok()
                     .and_then(|t| {
-                        let secs = t
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()?
-                            .as_secs();
+                        let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
                         // Format as YYYY-MM-DD HH:MM using chrono
                         use chrono::{DateTime, TimeZone, Utc};
                         let dt: DateTime<Utc> = Utc.timestamp_opt(secs as i64, 0).single()?;
@@ -843,7 +869,9 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Get a comprehensive summary of an open database: _readme contents, all tables with row counts and column schemas. Use this instead of calling list_tables + describe_table + SELECT COUNT(*) repeatedly.")]
+    #[tool(
+        description = "Get a comprehensive summary of an open database: _readme contents, all tables with row counts and column schemas. Use this instead of calling list_tables + describe_table + SELECT COUNT(*) repeatedly."
+    )]
     async fn database_info(&self, params: Parameters<AliasParams>) -> String {
         let alias = params.0.alias;
         let conns = self.connections.lock().unwrap();
@@ -867,7 +895,10 @@ impl LumenSqlite {
         if has_readme {
             lines.push(String::new());
             lines.push("## _readme".to_string());
-            if let Ok(mut stmt) = db.conn.prepare("SELECT key, value FROM _readme ORDER BY key") {
+            if let Ok(mut stmt) = db
+                .conn
+                .prepare("SELECT key, value FROM _readme ORDER BY key")
+            {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 }) {
@@ -880,9 +911,10 @@ impl LumenSqlite {
 
         // All tables
         let tables: Vec<String> = {
-            let mut stmt = match db.conn.prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-            ) {
+            let mut stmt = match db
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            {
                 Ok(s) => s,
                 Err(e) => return format!("Error reading tables: {e}"),
             };
@@ -908,7 +940,9 @@ impl LumenSqlite {
 
             let count: i64 = db
                 .conn
-                .query_row(&format!("SELECT COUNT(*) FROM \"{safe}\""), [], |r| r.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM \"{safe}\""), [], |r| {
+                    r.get(0)
+                })
                 .unwrap_or(-1);
             let count_str = if count < 0 {
                 "?".to_string()
@@ -922,11 +956,11 @@ impl LumenSqlite {
             if let Ok(mut stmt) = db.conn.prepare(&format!("PRAGMA table_info(\"{safe}\")")) {
                 if let Ok(cols) = stmt.query_map([], |row| {
                     Ok((
-                        row.get::<_, String>(1)?,  // name
-                        row.get::<_, String>(2)?,  // type
-                        row.get::<_, i32>(3)?,     // notnull
+                        row.get::<_, String>(1)?,         // name
+                        row.get::<_, String>(2)?,         // type
+                        row.get::<_, i32>(3)?,            // notnull
                         row.get::<_, Option<String>>(4)?, // default
-                        row.get::<_, i32>(5)?,     // pk
+                        row.get::<_, i32>(5)?,            // pk
                     ))
                 }) {
                     for col in cols.flatten() {
@@ -951,25 +985,43 @@ impl LumenSqlite {
 
             // Indexes on this table
             let indexes: Vec<(String, i32)> = {
-                let mut stmt = db.conn.prepare(&format!("PRAGMA index_list(\"{safe}\")")).ok();
-                stmt.as_mut().and_then(|s| {
-                    s.query_map([], |row| Ok((
-                        row.get::<_, String>(1)?,  // name
-                        row.get::<_, i32>(2)?,     // unique
-                    ))).ok().map(|m| m.flatten().collect())
-                }).unwrap_or_default()
+                let mut stmt = db
+                    .conn
+                    .prepare(&format!("PRAGMA index_list(\"{safe}\")"))
+                    .ok();
+                stmt.as_mut()
+                    .and_then(|s| {
+                        s.query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(1)?, // name
+                                row.get::<_, i32>(2)?,    // unique
+                            ))
+                        })
+                        .ok()
+                        .map(|m| m.flatten().collect())
+                    })
+                    .unwrap_or_default()
             };
             for (idx_name, unique) in &indexes {
                 let safe_idx = escape_identifier(idx_name);
                 let cols: Vec<String> = {
-                    let mut stmt = db.conn.prepare(&format!("PRAGMA index_info(\"{safe_idx}\")")).ok();
-                    stmt.as_mut().and_then(|s| {
-                        s.query_map([], |row| row.get::<_, String>(2)).ok()
-                            .map(|m| m.flatten().collect())
-                    }).unwrap_or_default()
+                    let mut stmt = db
+                        .conn
+                        .prepare(&format!("PRAGMA index_info(\"{safe_idx}\")"))
+                        .ok();
+                    stmt.as_mut()
+                        .and_then(|s| {
+                            s.query_map([], |row| row.get::<_, String>(2))
+                                .ok()
+                                .map(|m| m.flatten().collect())
+                        })
+                        .unwrap_or_default()
                 };
                 let unique_str = if *unique != 0 { "UNIQUE " } else { "" };
-                lines.push(format!("  {unique_str}INDEX {idx_name} ({})", cols.join(", ")));
+                lines.push(format!(
+                    "  {unique_str}INDEX {idx_name} ({})",
+                    cols.join(", ")
+                ));
             }
         }
 
@@ -977,7 +1029,9 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Safely copy an open database to a new file using SQLite's backup API. Safe to call while the database is in use.")]
+    #[tool(
+        description = "Safely copy an open database to a new file using SQLite's backup API. Safe to call while the database is in use."
+    )]
     async fn backup_database(&self, params: Parameters<BackupDatabaseParams>) -> String {
         let BackupDatabaseParams { alias, destination } = params.0;
         let dest_path = match self.resolve_db_path(&destination) {
@@ -1005,7 +1059,10 @@ impl LumenSqlite {
                     .map(|m| m.len() as f64 / 1024.0)
                     .unwrap_or(0.0);
                 info!("Backed up '{alias}' to {}", dest_path.display());
-                format!("Backed up '{alias}' to {} ({size_kb:.1} KB).", dest_path.display())
+                format!(
+                    "Backed up '{alias}' to {} ({size_kb:.1} KB).",
+                    dest_path.display()
+                )
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&dest_path);
@@ -1014,7 +1071,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Rebuild the database file to reclaim free space (VACUUM). After many DELETE operations, the database file doesn't shrink until VACUUM is run.")]
+    #[tool(
+        description = "Rebuild the database file to reclaim free space (VACUUM). After many DELETE operations, the database file doesn't shrink until VACUUM is run."
+    )]
     async fn compact_database(&self, params: Parameters<AliasParams>) -> String {
         let alias = params.0.alias;
         let conns = self.connections.lock().unwrap();
@@ -1042,9 +1101,15 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Create or replace a _readme table that self-documents the database. Call immediately after creating a new database. Do NOT call for databases from external sources.")]
+    #[tool(
+        description = "Create or replace a _readme table that self-documents the database. Call immediately after creating a new database. Do NOT call for databases from external sources."
+    )]
     async fn create_readme(&self, params: Parameters<CreateReadmeParams>) -> String {
-        let CreateReadmeParams { alias, purpose, tables } = params.0;
+        let CreateReadmeParams {
+            alias,
+            purpose,
+            tables,
+        } = params.0;
         let conns = self.connections.lock().unwrap();
         let db = match conns.get(&alias) {
             Some(d) => d,
@@ -1086,9 +1151,17 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Execute a single SQL statement. SELECT returns rows; INSERT/UPDATE/DELETE/DDL returns affected row count. Use ? placeholders with params to prevent injection. Paginate with offset+max_rows — increment offset by rows returned when response says more are available. TRAP: cannot span transactions — BEGIN in one call then COMMIT in another has no effect; use execute_script for manual transactions or bulk_insert for row batches.")]
+    #[tool(
+        description = "Execute a single SQL statement. SELECT returns rows; INSERT/UPDATE/DELETE/DDL returns affected row count. Use ? placeholders with params to prevent injection. Paginate with offset+max_rows — increment offset by rows returned when response says more are available. TRAP: cannot span transactions — BEGIN in one call then COMMIT in another has no effect; use execute_script for manual transactions or bulk_insert for row batches."
+    )]
     async fn execute_sql(&self, params: Parameters<ExecuteSqlParams>) -> String {
-        let ExecuteSqlParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
+        let ExecuteSqlParams {
+            alias,
+            sql,
+            params: bind_params,
+            max_rows,
+            offset,
+        } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
         let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
@@ -1112,14 +1185,10 @@ impl LumenSqlite {
             let col_names: Vec<String> =
                 stmt.column_names().iter().map(|&s| s.to_string()).collect();
 
-            let rows_result: rusqlite::Result<Vec<Vec<String>>> =
-                stmt.query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
+            let rows_result: rusqlite::Result<Vec<Vec<String>>> = stmt
+                .query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
                     let vals: Vec<String> = (0..col_count)
-                        .map(|i| {
-                            row.get_ref(i)
-                                .map(value_ref_to_string)
-                                .unwrap_or_default()
-                        })
+                        .map(|i| row.get_ref(i).map(value_ref_to_string).unwrap_or_default())
                         .collect();
                     Ok(vals)
                 })
@@ -1157,7 +1226,9 @@ impl LumenSqlite {
                     let start = offset + 1;
                     let end = offset + rows.len();
                     let status = if has_more {
-                        format!("(Rows {start}-{end}, more available. Call again with offset={end}.)")
+                        format!(
+                            "(Rows {start}-{end}, more available. Call again with offset={end}.)"
+                        )
                     } else {
                         format!("(Rows {start}-{end}.)")
                     };
@@ -1180,7 +1251,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Execute multiple semicolon-separated SQL statements in one call. Use for schema setup (CREATE TABLE, CREATE INDEX) or when you need manual transaction control (BEGIN; …; COMMIT). No parameter binding — never interpolate untrusted values into the script; use execute_sql with params for that.")]
+    #[tool(
+        description = "Execute multiple semicolon-separated SQL statements in one call. Use for schema setup (CREATE TABLE, CREATE INDEX) or when you need manual transaction control (BEGIN; …; COMMIT). No parameter binding — never interpolate untrusted values into the script; use execute_sql with params for that."
+    )]
     async fn execute_script(&self, params: Parameters<ExecuteScriptParams>) -> String {
         let ExecuteScriptParams { alias, script } = params.0;
         let conns = self.connections.lock().unwrap();
@@ -1194,9 +1267,15 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Show how SQLite will execute a query (EXPLAIN QUERY PLAN). Use to understand whether indices are used, whether full table scans occur, and the join order.")]
+    #[tool(
+        description = "Show how SQLite will execute a query (EXPLAIN QUERY PLAN). Use to understand whether indices are used, whether full table scans occur, and the join order."
+    )]
     async fn explain_query(&self, params: Parameters<ExplainQueryParams>) -> String {
-        let ExplainQueryParams { alias, sql, params: bind_params } = params.0;
+        let ExplainQueryParams {
+            alias,
+            sql,
+            params: bind_params,
+        } = params.0;
         let bind_params = bind_params.unwrap_or_default();
         let json_params: Vec<JsonParam> = bind_params.into_iter().map(JsonParam).collect();
 
@@ -1235,13 +1314,21 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Insert many rows into a pre-existing table in one transaction. 50-100x faster than repeated execute_sql INSERTs. Table must already exist — create it with execute_sql first if needed. conflict: 'error' (default, rolls back batch on violation), 'replace' (upsert), 'ignore' (skip violating rows silently).")]
+    #[tool(
+        description = "Insert many rows into a pre-existing table in one transaction. 50-100x faster than repeated execute_sql INSERTs. Table must already exist — create it with execute_sql first if needed. conflict: 'error' (default, rolls back batch on violation), 'replace' (upsert), 'ignore' (skip violating rows silently)."
+    )]
     async fn bulk_insert(&self, params: Parameters<BulkInsertParams>) -> String {
-        let BulkInsertParams { alias, table, columns, rows, conflict } = params.0;
+        let BulkInsertParams {
+            alias,
+            table,
+            columns,
+            rows,
+            conflict,
+        } = params.0;
         let conflict_kw = match conflict.as_deref().unwrap_or("error") {
             "replace" => "OR REPLACE ",
-            "ignore"  => "OR IGNORE ",
-            _         => "",
+            "ignore" => "OR IGNORE ",
+            _ => "",
         };
 
         if rows.is_empty() {
@@ -1265,7 +1352,10 @@ impl LumenSqlite {
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("INSERT {conflict_kw}INTO \"{}\" ({col_clause}) VALUES ({placeholders})", escape_identifier(&table));
+        let sql = format!(
+            "INSERT {conflict_kw}INTO \"{}\" ({col_clause}) VALUES ({placeholders})",
+            escape_identifier(&table)
+        );
 
         let conns = self.connections.lock().unwrap();
         let db = match conns.get(&alias) {
@@ -1277,8 +1367,7 @@ impl LumenSqlite {
             db.conn.execute_batch("BEGIN TRANSACTION")?;
             let mut stmt = db.conn.prepare(&sql)?;
             for row in &rows {
-                let json_params: Vec<JsonParam> =
-                    row.iter().cloned().map(JsonParam).collect();
+                let json_params: Vec<JsonParam> = row.iter().cloned().map(JsonParam).collect();
                 stmt.execute(rusqlite::params_from_iter(json_params.iter()))?;
             }
             drop(stmt);
@@ -1298,9 +1387,16 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Import inline CSV text into a table. Table auto-created from the header row with inferred types if absent. if_exists: 'error' (default), 'replace' (drop+recreate), 'append'. For large datasets, prefer import_csv_file to avoid oversized arguments.")]
+    #[tool(
+        description = "Import inline CSV text into a table. Table auto-created from the header row with inferred types if absent. if_exists: 'error' (default), 'replace' (drop+recreate), 'append'. For large datasets, prefer import_csv_file to avoid oversized arguments."
+    )]
     async fn import_csv(&self, params: Parameters<ImportCsvParams>) -> String {
-        let ImportCsvParams { alias, csv_text, table, if_exists } = params.0;
+        let ImportCsvParams {
+            alias,
+            csv_text,
+            table,
+            if_exists,
+        } = params.0;
         let table = table.unwrap_or_else(|| "imported".to_string());
         let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
 
@@ -1341,15 +1437,19 @@ impl LumenSqlite {
         };
 
         let escaped_table = escape_identifier(&table);
-        let col_types: Vec<&'static str> = (0..headers.len()).map(|ci| {
-            let samples: Vec<&str> = rows.iter()
-                .take(200)
-                .filter_map(|r| r.get(ci).map(|s| s.as_str()))
-                .collect();
-            infer_sqlite_type(&samples)
-        }).collect();
+        let col_types: Vec<&'static str> = (0..headers.len())
+            .map(|ci| {
+                let samples: Vec<&str> = rows
+                    .iter()
+                    .take(200)
+                    .filter_map(|r| r.get(ci).map(|s| s.as_str()))
+                    .collect();
+                infer_sqlite_type(&samples)
+            })
+            .collect();
         let col_defs: String = headers
-            .iter().zip(col_types.iter())
+            .iter()
+            .zip(col_types.iter())
             .map(|(h, t)| format!("\"{}\" {t}", escape_identifier(h)))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1361,7 +1461,8 @@ impl LumenSqlite {
 
         let result: rusqlite::Result<()> = (|| {
             if if_exists == "replace" {
-                db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+                db.conn
+                    .execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
             } else if if_exists == "error" {
                 let exists: bool = db.conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -1371,7 +1472,9 @@ impl LumenSqlite {
                 if exists {
                     return Err(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                        Some(format!("Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                        Some(format!(
+                            "Table '{table}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows."
+                        )),
                     ));
                 }
             }
@@ -1381,10 +1484,8 @@ impl LumenSqlite {
             db.conn.execute_batch("BEGIN TRANSACTION")?;
             let mut stmt = db.conn.prepare(&insert_sql)?;
             for row in &rows {
-                let row_refs: Vec<&dyn rusqlite::ToSql> = row
-                    .iter()
-                    .map(|s| s as &dyn rusqlite::ToSql)
-                    .collect();
+                let row_refs: Vec<&dyn rusqlite::ToSql> =
+                    row.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
                 stmt.execute(row_refs.as_slice())?;
             }
             drop(stmt);
@@ -1409,9 +1510,17 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as CSV text. Paginate with offset+max_rows — increment offset by rows returned when the response indicates more are available.")]
+    #[tool(
+        description = "Run a SELECT query and return results as CSV text. Paginate with offset+max_rows — increment offset by rows returned when the response indicates more are available."
+    )]
     async fn export_query_csv(&self, params: Parameters<ExportQueryCsvParams>) -> String {
-        let ExportQueryCsvParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
+        let ExportQueryCsvParams {
+            alias,
+            sql,
+            params: bind_params,
+            max_rows,
+            offset,
+        } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
         let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
@@ -1432,8 +1541,7 @@ impl LumenSqlite {
             return "Statement did not return results.".to_string();
         }
 
-        let col_names: Vec<String> =
-            stmt.column_names().iter().map(|&s| s.to_string()).collect();
+        let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
         let col_count = stmt.column_count();
 
         let mut output = Vec::new();
@@ -1442,14 +1550,10 @@ impl LumenSqlite {
             return format!("CSV error: {e}");
         }
 
-        let rows_result: rusqlite::Result<(usize, bool)> =
-            stmt.query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
+        let rows_result: rusqlite::Result<(usize, bool)> = stmt
+            .query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
                 let vals: Vec<String> = (0..col_count)
-                    .map(|i| {
-                        row.get_ref(i)
-                            .map(value_ref_to_string)
-                            .unwrap_or_default()
-                    })
+                    .map(|i| row.get_ref(i).map(value_ref_to_string).unwrap_or_default())
                     .collect();
                 Ok(vals)
             })
@@ -1486,7 +1590,9 @@ impl LumenSqlite {
                 if truncated {
                     let start = offset + 1;
                     let end = offset + count;
-                    csv_text.push_str(&format!("\n# Rows {start}-{end}, more available. Call again with offset={end}.\n"));
+                    csv_text.push_str(&format!(
+                        "\n# Rows {start}-{end}, more available. Call again with offset={end}.\n"
+                    ));
                 } else if offset > 0 {
                     let start = offset + 1;
                     let end = offset + count;
@@ -1497,9 +1603,15 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Inspect a CSV or TSV file on disk: detect the delimiter, identify column names from the header row, sample data rows, and infer likely SQLite column types. Use this before import_csv_file to understand an unfamiliar file's structure.")]
+    #[tool(
+        description = "Inspect a CSV or TSV file on disk: detect the delimiter, identify column names from the header row, sample data rows, and infer likely SQLite column types. Use this before import_csv_file to understand an unfamiliar file's structure."
+    )]
     async fn inspect_csv_file(&self, params: Parameters<InspectCsvFileParams>) -> String {
-        let InspectCsvFileParams { path, delimiter, sample_rows } = params.0;
+        let InspectCsvFileParams {
+            path,
+            delimiter,
+            sample_rows,
+        } = params.0;
         let sample_rows = sample_rows.unwrap_or(5);
 
         let file_path = match self.resolve_file_path(&path) {
@@ -1536,13 +1648,21 @@ impl LumenSqlite {
             }
         }
 
-        let delim_name = if delim_byte == b'\t' { "TSV (tab-separated)" } else { "CSV (comma-separated)" };
+        let delim_name = if delim_byte == b'\t' {
+            "TSV (tab-separated)"
+        } else {
+            "CSV (comma-separated)"
+        };
         let mut out = format!(
             "File: {}\nFormat: {}\nColumns: {}\nSample rows shown: {}\n\nColumn schema (inferred):\n",
-            file_path.display(), delim_name, headers.len(), samples.len(),
+            file_path.display(),
+            delim_name,
+            headers.len(),
+            samples.len(),
         );
         for (i, col) in headers.iter().enumerate() {
-            let col_vals: Vec<&str> = samples.iter()
+            let col_vals: Vec<&str> = samples
+                .iter()
                 .filter_map(|r| r.get(i).map(|s| s.as_str()))
                 .collect();
             let inferred = infer_sqlite_type(&col_vals);
@@ -1560,9 +1680,19 @@ impl LumenSqlite {
         out
     }
 
-    #[tool(description = "Import a CSV or TSV file from disk into a table. Delimiter auto-detected (.tsv→tab, others→comma). Table auto-created with inferred types if absent. IMPORTANT: if_exists defaults to 'error' — pass 'replace' to overwrite or 'append' to extend. Supply columns when has_headers=false.")]
+    #[tool(
+        description = "Import a CSV or TSV file from disk into a table. Delimiter auto-detected (.tsv→tab, others→comma). Table auto-created with inferred types if absent. IMPORTANT: if_exists defaults to 'error' — pass 'replace' to overwrite or 'append' to extend. Supply columns when has_headers=false."
+    )]
     async fn import_csv_file(&self, params: Parameters<ImportCsvFileParams>) -> String {
-        let ImportCsvFileParams { alias, path, table, has_headers, columns, delimiter, if_exists } = params.0;
+        let ImportCsvFileParams {
+            alias,
+            path,
+            table,
+            has_headers,
+            columns,
+            delimiter,
+            if_exists,
+        } = params.0;
         let has_headers = has_headers.unwrap_or(true);
         let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
 
@@ -1610,7 +1740,11 @@ impl LumenSqlite {
 
         let table_name = match table {
             Some(t) => t,
-            None => file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported").to_string(),
+            None => file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported")
+                .to_string(),
         };
         if let Err(e) = validate_identifier(&table_name, "table name") {
             return e;
@@ -1631,22 +1765,32 @@ impl LumenSqlite {
 
         let escaped_table = escape_identifier(&table_name);
         // Infer per-column types from sampled row data
-        let col_types: Vec<&'static str> = (0..col_names.len()).map(|ci| {
-            let samples: Vec<&str> = rows.iter()
-                .take(200)
-                .filter_map(|r| r.get(ci).map(|s| s.as_str()))
-                .collect();
-            infer_sqlite_type(&samples)
-        }).collect();
-        let col_defs: String = col_names.iter().zip(col_types.iter())
+        let col_types: Vec<&'static str> = (0..col_names.len())
+            .map(|ci| {
+                let samples: Vec<&str> = rows
+                    .iter()
+                    .take(200)
+                    .filter_map(|r| r.get(ci).map(|s| s.as_str()))
+                    .collect();
+                infer_sqlite_type(&samples)
+            })
+            .collect();
+        let col_defs: String = col_names
+            .iter()
+            .zip(col_types.iter())
             .map(|(c, t)| format!("\"{}\" {t}", escape_identifier(c)))
-            .collect::<Vec<_>>().join(", ");
-        let placeholders: String = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders: String = (0..col_names.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         let insert_sql = format!("INSERT INTO \"{escaped_table}\" VALUES ({placeholders})");
 
         let result: rusqlite::Result<()> = (|| {
             if if_exists == "replace" {
-                db.conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
+                db.conn
+                    .execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
             } else if if_exists == "error" {
                 let exists: bool = db.conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -1656,15 +1800,20 @@ impl LumenSqlite {
                 if exists {
                     return Err(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                        Some(format!("Table '{table_name}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows.")),
+                        Some(format!(
+                            "Table '{table_name}' already exists. Use if_exists='replace' to overwrite or if_exists='append' to add rows."
+                        )),
                     ));
                 }
             }
-            db.conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"))?;
+            db.conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS \"{escaped_table}\" ({col_defs})"
+            ))?;
             db.conn.execute_batch("BEGIN TRANSACTION")?;
             let mut stmt = db.conn.prepare(&insert_sql)?;
             for row in &rows {
-                let row_refs: Vec<&dyn rusqlite::ToSql> = row.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let row_refs: Vec<&dyn rusqlite::ToSql> =
+                    row.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
                 stmt.execute(row_refs.as_slice())?;
             }
             drop(stmt);
@@ -1674,10 +1823,17 @@ impl LumenSqlite {
 
         match result {
             Ok(()) => {
-                info!("Imported {} rows from '{}' into '{alias}.{table_name}'", rows.len(), file_path.display());
+                info!(
+                    "Imported {} rows from '{}' into '{alias}.{table_name}'",
+                    rows.len(),
+                    file_path.display()
+                );
                 format!(
                     "Imported {} rows into '{table_name}' from '{}' ({} columns: {}).",
-                    rows.len(), file_path.display(), col_names.len(), col_names.join(", ")
+                    rows.len(),
+                    file_path.display(),
+                    col_names.len(),
+                    col_names.join(", ")
                 )
             }
             Err(e) => {
@@ -1687,9 +1843,19 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and write results to a CSV or TSV file on disk. Use for large exports that would be unwieldy as inline text. Supports optional header row and custom delimiter. Returns a row count summary.")]
+    #[tool(
+        description = "Run a SELECT query and write results to a CSV or TSV file on disk. Use for large exports that would be unwieldy as inline text. Supports optional header row and custom delimiter. Returns a row count summary."
+    )]
     async fn export_query_csv_file(&self, params: Parameters<ExportQueryCsvFileParams>) -> String {
-        let ExportQueryCsvFileParams { alias, sql, params: bind_params, path, emit_headers, delimiter, max_rows } = params.0;
+        let ExportQueryCsvFileParams {
+            alias,
+            sql,
+            params: bind_params,
+            path,
+            emit_headers,
+            delimiter,
+            max_rows,
+        } = params.0;
         let emit_headers = emit_headers.unwrap_or(true);
         let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
         let bind_params = bind_params.unwrap_or_default();
@@ -1738,8 +1904,8 @@ impl LumenSqlite {
             }
         }
 
-        let rows_result: rusqlite::Result<(usize, bool)> =
-            stmt.query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
+        let rows_result: rusqlite::Result<(usize, bool)> = stmt
+            .query_map(rusqlite::params_from_iter(json_params.iter()), |row| {
                 let vals: Vec<String> = (0..col_count)
                     .map(|i| row.get_ref(i).map(value_ref_to_string).unwrap_or_default())
                     .collect();
@@ -1772,7 +1938,8 @@ impl LumenSqlite {
                 info!("Exported {count} rows to '{}'", file_path.display());
                 let mut msg = format!(
                     "Exported {count} rows to '{}' ({} columns).",
-                    file_path.display(), col_names.len()
+                    file_path.display(),
+                    col_names.len()
                 );
                 if truncated {
                     msg.push_str(&format!(" Truncated at {max_rows} rows."));
@@ -1782,9 +1949,16 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Import an inline JSON array of objects into a table. Table auto-created with types inferred from JSON values if absent. if_exists: 'error' (default), 'replace', 'append'. For large JSON, use import_json_file instead.")]
+    #[tool(
+        description = "Import an inline JSON array of objects into a table. Table auto-created with types inferred from JSON values if absent. if_exists: 'error' (default), 'replace', 'append'. For large JSON, use import_json_file instead."
+    )]
     async fn import_json(&self, params: Parameters<ImportJsonParams>) -> String {
-        let ImportJsonParams { alias, json_text, table, if_exists } = params.0;
+        let ImportJsonParams {
+            alias,
+            json_text,
+            table,
+            if_exists,
+        } = params.0;
         let table = table.unwrap_or_else(|| "imported".to_string());
         let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
 
@@ -1796,7 +1970,13 @@ impl LumenSqlite {
             match serde_json::from_str::<serde_json::Value>(&json_text) {
                 Ok(serde_json::Value::Array(arr)) => arr
                     .into_iter()
-                    .filter_map(|v| if let serde_json::Value::Object(m) = v { Some(m) } else { None })
+                    .filter_map(|v| {
+                        if let serde_json::Value::Object(m) = v {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
                     .collect(),
                 Ok(_) => return "JSON must be an array of objects.".to_string(),
                 Err(e) => return format!("JSON parse error: {e}"),
@@ -1814,12 +1994,27 @@ impl LumenSqlite {
             }
         }
 
-        import_json_objects(&self.connections, &alias, &table, &if_exists, &col_names, &arr)
+        import_json_objects(
+            &self.connections,
+            &alias,
+            &table,
+            &if_exists,
+            &col_names,
+            &arr,
+        )
     }
 
-    #[tool(description = "Import a JSON file into a table. format: 'array' (default, JSON array of objects) or 'ndjson' (one object per line, good for large files). if_exists: 'error' (default), 'replace', 'append'. Table auto-created with inferred types if absent.")]
+    #[tool(
+        description = "Import a JSON file into a table. format: 'array' (default, JSON array of objects) or 'ndjson' (one object per line, good for large files). if_exists: 'error' (default), 'replace', 'append'. Table auto-created with inferred types if absent."
+    )]
     async fn import_json_file(&self, params: Parameters<ImportJsonFileParams>) -> String {
-        let ImportJsonFileParams { alias, path, table, format, if_exists } = params.0;
+        let ImportJsonFileParams {
+            alias,
+            path,
+            table,
+            format,
+            if_exists,
+        } = params.0;
         let if_exists = if_exists.unwrap_or_else(|| "error".to_string());
         let format = format.unwrap_or_else(|| "array".to_string());
 
@@ -1830,7 +2025,11 @@ impl LumenSqlite {
 
         let table = match table {
             Some(t) => t,
-            None => file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported").to_string(),
+            None => file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported")
+                .to_string(),
         };
         if let Err(e) = validate_identifier(&table, "table name") {
             return e;
@@ -1845,7 +2044,9 @@ impl LumenSqlite {
             let mut objs = Vec::new();
             for (i, line) in raw.lines().enumerate() {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(serde_json::Value::Object(m)) => objs.push(m),
                     Ok(_) => return format!("Line {}: expected a JSON object.", i + 1),
@@ -1857,9 +2058,18 @@ impl LumenSqlite {
             match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(serde_json::Value::Array(arr)) => arr
                     .into_iter()
-                    .filter_map(|v| if let serde_json::Value::Object(m) = v { Some(m) } else { None })
+                    .filter_map(|v| {
+                        if let serde_json::Value::Object(m) = v {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
                     .collect(),
-                Ok(_) => return "JSON file must contain an array of objects (or use format='ndjson').".to_string(),
+                Ok(_) => {
+                    return "JSON file must contain an array of objects (or use format='ndjson')."
+                        .to_string();
+                }
                 Err(e) => return format!("JSON parse error: {e}"),
             }
         };
@@ -1875,14 +2085,33 @@ impl LumenSqlite {
             }
         }
 
-        let result = import_json_objects(&self.connections, &alias, &table, &if_exists, &col_names, &arr);
+        let result = import_json_objects(
+            &self.connections,
+            &alias,
+            &table,
+            &if_exists,
+            &col_names,
+            &arr,
+        );
         info!("Imported from JSON file '{}'", file_path.display());
         result
     }
 
-    #[tool(description = "Run a SELECT query and write results to a JSON file: either a JSON array of objects (format='array', default) or NDJSON with one object per line (format='ndjson', streaming-friendly for large files).")]
-    async fn export_query_json_file(&self, params: Parameters<ExportQueryJsonFileParams>) -> String {
-        let ExportQueryJsonFileParams { alias, sql, params: bind_params, path, format, max_rows } = params.0;
+    #[tool(
+        description = "Run a SELECT query and write results to a JSON file: either a JSON array of objects (format='array', default) or NDJSON with one object per line (format='ndjson', streaming-friendly for large files)."
+    )]
+    async fn export_query_json_file(
+        &self,
+        params: Parameters<ExportQueryJsonFileParams>,
+    ) -> String {
+        let ExportQueryJsonFileParams {
+            alias,
+            sql,
+            params: bind_params,
+            path,
+            format,
+            max_rows,
+        } = params.0;
         let format = format.unwrap_or_else(|| "array".to_string());
         let max_rows = max_rows.unwrap_or(self.default_export_max_rows);
         let bind_params = bind_params.unwrap_or_default();
@@ -1910,7 +2139,10 @@ impl LumenSqlite {
         let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
         let col_count = stmt.column_count();
 
-        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::ToSql)
+            .collect();
         let rows_iter = match stmt.query(param_refs.as_slice()) {
             Ok(r) => r,
             Err(e) => return format!("Query error: {e}"),
@@ -1934,13 +2166,15 @@ impl LumenSqlite {
                         let val = match row.get_ref(i) {
                             Ok(ValueRef::Null) => serde_json::Value::Null,
                             Ok(ValueRef::Integer(n)) => serde_json::Value::Number(n.into()),
-                            Ok(ValueRef::Real(f)) => {
-                                serde_json::Number::from_f64(f)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
+                            Ok(ValueRef::Real(f)) => serde_json::Number::from_f64(f)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null),
+                            Ok(ValueRef::Text(t)) => {
+                                serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
                             }
-                            Ok(ValueRef::Text(t)) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
-                            Ok(ValueRef::Blob(b)) => serde_json::Value::String(format!("<blob {} bytes>", b.len())),
+                            Ok(ValueRef::Blob(b)) => {
+                                serde_json::Value::String(format!("<blob {} bytes>", b.len()))
+                            }
                             Err(_) => serde_json::Value::Null,
                         };
                         obj.insert(col_names[i].clone(), val);
@@ -1973,10 +2207,16 @@ impl LumenSqlite {
         match write_result {
             Err(e) => format!("Write error: {e}"),
             Ok(()) => {
-                info!("Exported {} rows to '{}' as JSON {format}", rows.len(), file_path.display());
+                info!(
+                    "Exported {} rows to '{}' as JSON {format}",
+                    rows.len(),
+                    file_path.display()
+                );
                 let mut msg = format!(
                     "Exported {} rows to '{}' ({format}, {} columns).",
-                    rows.len(), file_path.display(), col_names.len()
+                    rows.len(),
+                    file_path.display(),
+                    col_names.len()
                 );
                 if truncated {
                     msg.push_str(&format!(" Truncated at {max_rows} rows."));
@@ -1986,9 +2226,17 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Run a SELECT query and return results as a Markdown table for display in chat. Pipe characters in cells are auto-escaped. Paginate with offset+max_rows the same way as execute_sql.")]
+    #[tool(
+        description = "Run a SELECT query and return results as a Markdown table for display in chat. Pipe characters in cells are auto-escaped. Paginate with offset+max_rows the same way as execute_sql."
+    )]
     async fn export_query_markdown(&self, params: Parameters<ExportQueryMarkdownParams>) -> String {
-        let ExportQueryMarkdownParams { alias, sql, params: bind_params, max_rows, offset } = params.0;
+        let ExportQueryMarkdownParams {
+            alias,
+            sql,
+            params: bind_params,
+            max_rows,
+            offset,
+        } = params.0;
         let max_rows = max_rows.unwrap_or(self.default_max_rows);
         let offset = offset.unwrap_or(0);
         let bind_params = bind_params.unwrap_or_default();
@@ -2011,7 +2259,10 @@ impl LumenSqlite {
         let col_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
         let col_count = stmt.column_count();
 
-        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = json_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::ToSql)
+            .collect();
         let rows_iter = match stmt.query(param_refs.as_slice()) {
             Ok(r) => r,
             Err(e) => return format!("Query error: {e}"),
@@ -2090,7 +2341,9 @@ impl LumenSqlite {
         if truncated {
             let start = offset + 1;
             let end = offset + data.len();
-            out.push_str(&format!("\n_(Rows {start}-{end}, more available. Call again with `offset={end}`.)_\n"));
+            out.push_str(&format!(
+                "\n_(Rows {start}-{end}, more available. Call again with `offset={end}`.)_\n"
+            ));
         } else if offset > 0 {
             let start = offset + 1;
             let end = offset + data.len();
@@ -2099,9 +2352,15 @@ impl LumenSqlite {
         out
     }
 
-    #[tool(description = "Profile a table: row count, NULL count, distinct count, min/max, and avg per column. A one-call replacement for many exploratory SELECT queries on an unfamiliar dataset.")]
+    #[tool(
+        description = "Profile a table: row count, NULL count, distinct count, min/max, and avg per column. A one-call replacement for many exploratory SELECT queries on an unfamiliar dataset."
+    )]
     async fn table_stats(&self, params: Parameters<TableStatsParams>) -> String {
-        let TableStatsParams { alias, table, columns } = params.0;
+        let TableStatsParams {
+            alias,
+            table,
+            columns,
+        } = params.0;
         if let Err(e) = validate_identifier(&table, "table name") {
             return e;
         }
@@ -2114,13 +2373,19 @@ impl LumenSqlite {
         let safe_table = escape_identifier(&table);
 
         let all_cols: Vec<(String, String)> = {
-            let mut stmt = db.conn.prepare(&format!("PRAGMA table_info(\"{safe_table}\")")).ok();
-            stmt.as_mut().and_then(|s| {
-                s.query_map([], |row| Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))).ok().map(|m| m.flatten().collect())
-            }).unwrap_or_default()
+            let mut stmt = db
+                .conn
+                .prepare(&format!("PRAGMA table_info(\"{safe_table}\")"))
+                .ok();
+            stmt.as_mut()
+                .and_then(|s| {
+                    s.query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })
+                    .ok()
+                    .map(|m| m.flatten().collect())
+                })
+                .unwrap_or_default()
         };
 
         if all_cols.is_empty() {
@@ -2128,7 +2393,10 @@ impl LumenSqlite {
         }
 
         let col_info: Vec<(String, String)> = if let Some(requested) = columns {
-            all_cols.into_iter().filter(|(n, _)| requested.contains(n)).collect()
+            all_cols
+                .into_iter()
+                .filter(|(n, _)| requested.contains(n))
+                .collect()
         } else {
             all_cols
         };
@@ -2149,36 +2417,55 @@ impl LumenSqlite {
 
         for (col_name, col_type) in &col_info {
             let safe_col = escape_identifier(col_name);
-            let stats: Option<(i64, i64, Option<String>, Option<String>, Option<f64>)> =
-                db.conn.query_row(
+            let stats: Option<(i64, i64, Option<String>, Option<String>, Option<f64>)> = db
+                .conn
+                .query_row(
                     &format!(
                         "SELECT COUNT(\"{safe_col}\"), COUNT(DISTINCT \"{safe_col}\"), \
                          CAST(MIN(\"{safe_col}\") AS TEXT), CAST(MAX(\"{safe_col}\") AS TEXT), \
                          AVG(CAST(\"{safe_col}\" AS REAL)) FROM \"{safe_table}\""
                     ),
                     [],
-                    |row| Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<f64>>(4)?,
-                    )),
-                ).ok();
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<f64>>(4)?,
+                        ))
+                    },
+                )
+                .ok();
 
             lines.push(String::new());
             if let Some((non_null, distinct, min_val, max_val, avg_val)) = stats {
                 let null_count = total_rows - non_null;
-                let type_str = if col_type.is_empty() { "?".to_string() } else { col_type.clone() };
+                let type_str = if col_type.is_empty() {
+                    "?".to_string()
+                } else {
+                    col_type.clone()
+                };
                 let null_str = if null_count == 0 {
                     "0 nulls".to_string()
                 } else {
-                    format!("{null_count} nulls ({:.1}%)", null_count as f64 / total_rows as f64 * 100.0)
+                    format!(
+                        "{null_count} nulls ({:.1}%)",
+                        null_count as f64 / total_rows as f64 * 100.0
+                    )
                 };
                 let min_str = min_val.as_deref().unwrap_or("NULL");
                 let max_str = max_val.as_deref().unwrap_or("NULL");
-                let min_d = if min_str.len() > 30 { format!("{}...", &min_str[..30]) } else { min_str.to_string() };
-                let max_d = if max_str.len() > 30 { format!("{}...", &max_str[..30]) } else { max_str.to_string() };
+                let min_d = if min_str.len() > 30 {
+                    format!("{}...", &min_str[..30])
+                } else {
+                    min_str.to_string()
+                };
+                let max_d = if max_str.len() > 30 {
+                    format!("{}...", &max_str[..30])
+                } else {
+                    max_str.to_string()
+                };
                 lines.push(format!("  {col_name}  [{type_str}]  non_null: {non_null}  {null_str}  distinct: {distinct}"));
                 lines.push(format!("    min: {min_d}  max: {max_d}"));
                 if let Some(avg) = avg_val {
@@ -2192,9 +2479,15 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Attach a second SQLite file to an open connection. Its tables become accessible as schema_name.table_name for cross-database JOINs and copies. No new alias is created — all queries run on the main alias. Call detach_database when done to release the file lock.")]
+    #[tool(
+        description = "Attach a second SQLite file to an open connection. Its tables become accessible as schema_name.table_name for cross-database JOINs and copies. No new alias is created — all queries run on the main alias. Call detach_database when done to release the file lock."
+    )]
     async fn attach_database(&self, params: Parameters<AttachDatabaseParams>) -> String {
-        let AttachDatabaseParams { alias, path, schema_name } = params.0;
+        let AttachDatabaseParams {
+            alias,
+            path,
+            schema_name,
+        } = params.0;
         if let Err(e) = validate_identifier(&schema_name, "schema name") {
             return e;
         }
@@ -2212,7 +2505,10 @@ impl LumenSqlite {
         let sql = format!("ATTACH DATABASE '{path_str}' AS \"{safe_schema}\"");
         match db.conn.execute_batch(&sql) {
             Ok(()) => {
-                info!("Attached '{}' as schema '{schema_name}' on '{alias}'", file_path.display());
+                info!(
+                    "Attached '{}' as schema '{schema_name}' on '{alias}'",
+                    file_path.display()
+                );
                 format!(
                     "Attached '{}' as schema '{schema_name}'. \
                      Tables are accessible as \"{schema_name}\".table_name in queries.",
@@ -2223,7 +2519,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Remove a previously attached schema from a connection and release its file lock. Does not close the main connection or delete any files.")]
+    #[tool(
+        description = "Remove a previously attached schema from a connection and release its file lock. Does not close the main connection or delete any files."
+    )]
     async fn detach_database(&self, params: Parameters<DetachDatabaseParams>) -> String {
         let DetachDatabaseParams { alias, schema_name } = params.0;
         if let Err(e) = validate_identifier(&schema_name, "schema name") {
@@ -2235,7 +2533,10 @@ impl LumenSqlite {
             None => return Self::no_such_alias(&alias, &conns),
         };
         let safe_schema = escape_identifier(&schema_name);
-        match db.conn.execute_batch(&format!("DETACH DATABASE \"{safe_schema}\"")) {
+        match db
+            .conn
+            .execute_batch(&format!("DETACH DATABASE \"{safe_schema}\""))
+        {
             Ok(()) => {
                 info!("Detached schema '{schema_name}' from '{alias}'");
                 format!("Detached schema '{schema_name}'.")
@@ -2244,31 +2545,51 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Create an index to speed up WHERE, JOIN, and ORDER BY on the indexed columns. Name auto-generated as idx_table_col1_col2 if omitted. unique=true enforces uniqueness. where_clause creates a partial (filtered) index. Use explain_query to verify index usage.")]
+    #[tool(
+        description = "Create an index to speed up WHERE, JOIN, and ORDER BY on the indexed columns. Name auto-generated as idx_table_col1_col2 if omitted. unique=true enforces uniqueness. where_clause creates a partial (filtered) index. Use explain_query to verify index usage."
+    )]
     async fn create_index(&self, params: Parameters<CreateIndexParams>) -> String {
-        let CreateIndexParams { alias, table, columns, index_name, unique, where_clause, if_not_exists } = params.0;
+        let CreateIndexParams {
+            alias,
+            table,
+            columns,
+            index_name,
+            unique,
+            where_clause,
+            if_not_exists,
+        } = params.0;
         let unique = unique.unwrap_or(false);
         let if_not_exists = if_not_exists.unwrap_or(false);
 
-        if let Err(e) = validate_identifier(&table, "table name") { return e; }
-        if columns.is_empty() { return "At least one column is required.".to_string(); }
+        if let Err(e) = validate_identifier(&table, "table name") {
+            return e;
+        }
+        if columns.is_empty() {
+            return "At least one column is required.".to_string();
+        }
         for col in &columns {
-            if let Err(e) = validate_identifier(col, "column name") { return e; }
+            if let Err(e) = validate_identifier(col, "column name") {
+                return e;
+            }
         }
 
         let idx_name = match index_name {
             Some(n) => n,
             None => format!("idx_{}_{}", table, columns.join("_")),
         };
-        if let Err(e) = validate_identifier(&idx_name, "index name") { return e; }
+        if let Err(e) = validate_identifier(&idx_name, "index name") {
+            return e;
+        }
 
         let unique_kw = if unique { "UNIQUE " } else { "" };
         let ine_kw = if if_not_exists { "IF NOT EXISTS " } else { "" };
-        let col_list = columns.iter()
+        let col_list = columns
+            .iter()
             .map(|c| format!("\"{}\"", escape_identifier(c)))
             .collect::<Vec<_>>()
             .join(", ");
-        let where_part = where_clause.as_deref()
+        let where_part = where_clause
+            .as_deref()
             .map(|w| format!(" WHERE {w}"))
             .unwrap_or_default();
         let sql = format!(
@@ -2295,12 +2616,20 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Drop an index. Never deletes data — only removes the index structure. Call without confirm to preview (table name, DDL). Call with confirm=true to execute.")]
+    #[tool(
+        description = "Drop an index. Never deletes data — only removes the index structure. Call without confirm to preview (table name, DDL). Call with confirm=true to execute."
+    )]
     async fn drop_index(&self, params: Parameters<DropIndexParams>) -> String {
-        let DropIndexParams { alias, index_name, confirm } = params.0;
+        let DropIndexParams {
+            alias,
+            index_name,
+            confirm,
+        } = params.0;
         let confirm = confirm.unwrap_or(false);
 
-        if let Err(e) = validate_identifier(&index_name, "index name") { return e; }
+        if let Err(e) = validate_identifier(&index_name, "index name") {
+            return e;
+        }
 
         let conns = self.connections.lock().unwrap();
         let db = match conns.get(&alias) {
@@ -2308,14 +2637,14 @@ impl LumenSqlite {
             None => return Self::no_such_alias(&alias, &conns),
         };
 
-        let info: Option<(String, Option<String>)> = db.conn.query_row(
-            "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?1",
-            rusqlite::params![index_name],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            )),
-        ).ok();
+        let info: Option<(String, Option<String>)> = db
+            .conn
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?1",
+                rusqlite::params![index_name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .ok();
 
         let (tbl_name, idx_ddl) = match info {
             Some(i) => i,
@@ -2323,7 +2652,9 @@ impl LumenSqlite {
         };
 
         if !confirm {
-            let ddl_line = idx_ddl.as_deref().unwrap_or("(auto-generated — no stored DDL)");
+            let ddl_line = idx_ddl
+                .as_deref()
+                .unwrap_or("(auto-generated — no stored DDL)");
             return format!(
                 "Preview: DROP INDEX '{index_name}' on table '{tbl_name}'\nDDL: {ddl_line}\nCall again with confirm=true to drop."
             );
@@ -2339,24 +2670,40 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Add a column to an existing table (ALTER TABLE ... ADD COLUMN). Defaults to TEXT type. NOT NULL requires a default_value (SQLite restriction).")]
+    #[tool(
+        description = "Add a column to an existing table (ALTER TABLE ... ADD COLUMN). Defaults to TEXT type. NOT NULL requires a default_value (SQLite restriction)."
+    )]
     async fn add_column(&self, params: Parameters<AddColumnParams>) -> String {
-        let AddColumnParams { alias, table, column, col_type, not_null, default_value } = params.0;
+        let AddColumnParams {
+            alias,
+            table,
+            column,
+            col_type,
+            not_null,
+            default_value,
+        } = params.0;
         let col_type = col_type.unwrap_or_else(|| "TEXT".to_string());
         let not_null = not_null.unwrap_or(false);
 
-        if let Err(e) = validate_identifier(&table, "table name") { return e; }
-        if let Err(e) = validate_identifier(&column, "column name") { return e; }
+        if let Err(e) = validate_identifier(&table, "table name") {
+            return e;
+        }
+        if let Err(e) = validate_identifier(&column, "column name") {
+            return e;
+        }
 
         if not_null && default_value.is_none() {
             return "NOT NULL requires a default_value (SQLite requires a non-null default \
-                    for columns added via ALTER TABLE ADD COLUMN).".to_string();
+                    for columns added via ALTER TABLE ADD COLUMN)."
+                .to_string();
         }
 
         let safe_table = escape_identifier(&table);
         let safe_col = escape_identifier(&column);
         let mut sql = format!("ALTER TABLE \"{safe_table}\" ADD COLUMN \"{safe_col}\" {col_type}");
-        if not_null { sql.push_str(" NOT NULL"); }
+        if not_null {
+            sql.push_str(" NOT NULL");
+        }
         if let Some(ref def) = default_value {
             sql.push_str(&format!(" DEFAULT {def}"));
         }
@@ -2370,8 +2717,12 @@ impl LumenSqlite {
             Ok(()) => {
                 info!("Added column '{column}' ({col_type}) to '{alias}.{table}'");
                 let mut desc = format!("Added column '{column}' ({col_type})");
-                if not_null { desc.push_str(" NOT NULL"); }
-                if let Some(ref def) = default_value { desc.push_str(&format!(" DEFAULT {def}")); }
+                if not_null {
+                    desc.push_str(" NOT NULL");
+                }
+                if let Some(ref def) = default_value {
+                    desc.push_str(&format!(" DEFAULT {def}"));
+                }
                 desc.push_str(&format!(" to table '{table}'."));
                 desc
             }
@@ -2379,7 +2730,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "List all user tables. Prefer database_info for a full overview including row counts, column schemas, and indexes.")]
+    #[tool(
+        description = "List all user tables. Prefer database_info for a full overview including row counts, column schemas, and indexes."
+    )]
     async fn list_tables(&self, params: Parameters<AliasParams>) -> String {
         let alias = params.0.alias;
         let conns = self.connections.lock().unwrap();
@@ -2403,7 +2756,9 @@ impl LumenSqlite {
         }
     }
 
-    #[tool(description = "Show a table's column definitions (names, types, constraints, DDL) and all its indexes. Prefer database_info for a multi-table overview.")]
+    #[tool(
+        description = "Show a table's column definitions (names, types, constraints, DDL) and all its indexes. Prefer database_info for a multi-table overview."
+    )]
     async fn describe_table(&self, params: Parameters<TableParams>) -> String {
         let TableParams { alias, table } = params.0;
         let conns = self.connections.lock().unwrap();
@@ -2476,14 +2831,23 @@ impl LumenSqlite {
         // Indexes
         let safe = escape_identifier(&table);
         let indexes: Vec<(String, i32, String)> = {
-            let mut stmt = db.conn.prepare(&format!("PRAGMA index_list(\"{safe}\")")).ok();
-            stmt.as_mut().and_then(|s| {
-                s.query_map([], |row| Ok((
-                    row.get::<_, String>(1)?,  // name
-                    row.get::<_, i32>(2)?,     // unique
-                    row.get::<_, String>(3)?,  // origin: c=CREATE INDEX, u=UNIQUE constraint, pk=PRIMARY KEY
-                ))).ok().map(|m| m.flatten().collect())
-            }).unwrap_or_default()
+            let mut stmt = db
+                .conn
+                .prepare(&format!("PRAGMA index_list(\"{safe}\")"))
+                .ok();
+            stmt.as_mut()
+                .and_then(|s| {
+                    s.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(1)?, // name
+                            row.get::<_, i32>(2)?,    // unique
+                            row.get::<_, String>(3)?, // origin: c=CREATE INDEX, u=UNIQUE constraint, pk=PRIMARY KEY
+                        ))
+                    })
+                    .ok()
+                    .map(|m| m.flatten().collect())
+                })
+                .unwrap_or_default()
         };
 
         if !indexes.is_empty() {
@@ -2492,28 +2856,46 @@ impl LumenSqlite {
             for (idx_name, unique, origin) in &indexes {
                 let safe_idx = escape_identifier(idx_name);
                 let cols: Vec<String> = {
-                    let mut stmt = db.conn.prepare(&format!("PRAGMA index_info(\"{safe_idx}\")")).ok();
-                    stmt.as_mut().and_then(|s| {
-                        s.query_map([], |row| row.get::<_, String>(2)).ok()
-                            .map(|m| m.flatten().collect())
-                    }).unwrap_or_default()
+                    let mut stmt = db
+                        .conn
+                        .prepare(&format!("PRAGMA index_info(\"{safe_idx}\")"))
+                        .ok();
+                    stmt.as_mut()
+                        .and_then(|s| {
+                            s.query_map([], |row| row.get::<_, String>(2))
+                                .ok()
+                                .map(|m| m.flatten().collect())
+                        })
+                        .unwrap_or_default()
                 };
                 let kind = match origin.as_str() {
                     "pk" => "PRIMARY KEY",
-                    "u"  => "UNIQUE constraint",
-                    _    => if *unique != 0 { "UNIQUE INDEX" } else { "INDEX" },
+                    "u" => "UNIQUE constraint",
+                    _ => {
+                        if *unique != 0 {
+                            "UNIQUE INDEX"
+                        } else {
+                            "INDEX"
+                        }
+                    }
                 };
                 // Get DDL for explicit CREATE INDEX (origin == "c")
                 let idx_ddl: Option<String> = if origin == "c" {
-                    db.conn.query_row(
-                        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
-                        rusqlite::params![idx_name],
-                        |row| row.get(0),
-                    ).ok().flatten()
+                    db.conn
+                        .query_row(
+                            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                            rusqlite::params![idx_name],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
-                lines.push(format!("  {idx_name}  [{kind}]  columns: ({})", cols.join(", ")));
+                lines.push(format!(
+                    "  {idx_name}  [{kind}]  columns: ({})",
+                    cols.join(", ")
+                ));
                 if let Some(ddl) = idx_ddl {
                     lines.push(format!("    {ddl}"));
                 }
@@ -2523,9 +2905,15 @@ impl LumenSqlite {
         lines.join("\n")
     }
 
-    #[tool(description = "Drop a table permanently. Call without confirm to preview (row count, columns). Call with confirm=true to execute. Irreversible — verify you no longer need the data before confirming.")]
+    #[tool(
+        description = "Drop a table permanently. Call without confirm to preview (row count, columns). Call with confirm=true to execute. Irreversible — verify you no longer need the data before confirming."
+    )]
     async fn drop_table(&self, params: Parameters<DropTableParams>) -> String {
-        let DropTableParams { alias, table, confirm } = params.0;
+        let DropTableParams {
+            alias,
+            table,
+            confirm,
+        } = params.0;
         let confirm = confirm.unwrap_or(false);
 
         let conns = self.connections.lock().unwrap();
@@ -2551,7 +2939,9 @@ impl LumenSqlite {
 
         let count: i64 = db
             .conn
-            .query_row(&format!("SELECT COUNT(*) FROM \"{safe}\""), [], |r| r.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM \"{safe}\""), [], |r| {
+                r.get(0)
+            })
             .unwrap_or(-1);
 
         let col_names: Vec<String> = db
@@ -2583,7 +2973,11 @@ impl LumenSqlite {
 
     #[tool(description = "Rename a table in place. All data, indexes, and triggers are preserved.")]
     async fn rename_table(&self, params: Parameters<RenameTableParams>) -> String {
-        let RenameTableParams { alias, old_name, new_name } = params.0;
+        let RenameTableParams {
+            alias,
+            old_name,
+            new_name,
+        } = params.0;
 
         if let Err(e) = validate_identifier(&new_name, "new table name") {
             return e;
@@ -2609,8 +3003,9 @@ impl LumenSqlite {
 
         let old_safe = escape_identifier(&old_name);
         let new_safe = escape_identifier(&new_name);
-        match db.conn.execute_batch(&format!("ALTER TABLE \"{old_safe}\" RENAME TO \"{new_safe}\""))
-        {
+        match db.conn.execute_batch(&format!(
+            "ALTER TABLE \"{old_safe}\" RENAME TO \"{new_safe}\""
+        )) {
             Ok(()) => {
                 info!("Renamed table '{old_name}' to '{new_name}' in '{alias}'");
                 format!("Renamed table '{old_name}' to '{new_name}'.")
@@ -2642,9 +3037,10 @@ impl ServerHandler for LumenSqlite {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
-            .with_server_info(
-                rmcp::model::Implementation::new("lumen-sqlite", env!("CARGO_PKG_VERSION"))
-            )
+            .with_server_info(rmcp::model::Implementation::new(
+                "lumen-sqlite",
+                env!("CARGO_PKG_VERSION"),
+            ))
     }
 }
 
@@ -2663,8 +3059,7 @@ async fn main() -> anyhow::Result<()> {
     // Log to stderr (stdout is the MCP transport)
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_ansi(false)
         .with_writer(std::io::stderr)

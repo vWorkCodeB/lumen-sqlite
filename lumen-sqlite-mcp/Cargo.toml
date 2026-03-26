@@ -1,10 +1,12 @@
 [package]
 name = "lumen-sqlite-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "An MCP server for storing and manipulating structured data using SQLite"
 license = "MIT OR Apache-2.0"
 authors = ["Arlie Davis <ardavis@microsoft.com>"]
+repository = "https://github.com/sivadeilra/lumen-sqlite-mcp"
+readme = "../README.md"
 
 [dependencies]
 anyhow = "1"
